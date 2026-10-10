@@ -1,0 +1,107 @@
+name: build
+
+# 什么时候跑：
+#   - 推送到 main / master
+#   - 手动：仓库页面 Actions -> build -> Run workflow
+#   - 打 v* 标签时也会跑（产物在 Actions 里照样能下）
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 在云端 Windows 上编译 exe，并用 Inno Setup 打包成安装程序。
+  # 云端 runner 是完整 Windows，cmd.exe 和 PATH 都正常，
+  # 完全不受本机环境（PATH 损坏 / 没有 cmd）的影响。
+  # ---------------------------------------------------------------------------
+  windows:
+    name: Windows exe + 安装包
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          # 用 go.mod 里的 go 指令当最低版本要求（现在是 1.21），
+          # check-latest 让它装最新的 1.2x 稳定版。
+          # 不要写死具体补丁号 —— 云端缓存里未必有那个版本，会直接报错。
+          go-version-file: go.mod
+          check-latest: true
+          cache: false
+
+      - name: 编译 windows/amd64
+        shell: cmd
+        run: |
+          if not exist dist mkdir dist
+          go build -trimpath -ldflags "-s -w" -o dist/dming-windows-amd64.exe .
+
+      - name: 冒烟测试（跑一下 --help，确认不是坏二进制）
+        shell: cmd
+        continue-on-error: true
+        run: dist\dming-windows-amd64.exe -h
+
+      - name: 安装 Inno Setup 6
+        shell: cmd
+        run: choco install innosetup --no-progress -y
+
+      - name: 打包安装程序
+        shell: cmd
+        run: '"C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\dming.iss'
+
+      - name: 列出产物
+        shell: cmd
+        run: dir /b dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dming-windows
+          if-no-files-found: error
+          path: |
+            dist/dming-windows-amd64.exe
+            dist/dming-*-setup.exe
+
+  # ---------------------------------------------------------------------------
+  # 顺带交叉编译其他平台，跟 Windows 产物一起在 Actions 页面下载。
+  # ---------------------------------------------------------------------------
+  cross:
+    name: ${{ matrix.goos }}-${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { goos: linux,   goarch: amd64 }
+          - { goos: linux,   goarch: arm64 }
+          - { goos: darwin,  goarch: amd64 }
+          - { goos: darwin,  goarch: arm64 }
+          - { goos: android, goarch: arm64 }   # Termux
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          check-latest: true
+          cache: false
+
+      - name: 编译 ${{ matrix.goos }}/${{ matrix.goarch }}
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: '0'
+        run: |
+          mkdir -p dist
+          go build -trimpath -ldflags "-s -w" \
+            -o "dist/dming-${{ matrix.goos }}-${{ matrix.goarch }}" .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dming-${{ matrix.goos }}-${{ matrix.goarch }}
+          if-no-files-found: error
+          path: dist/dming-${{ matrix.goos }}-${{ matrix.goarch }}

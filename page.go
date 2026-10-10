@@ -1,0 +1,403 @@
+package main
+
+import (
+	"bytes"
+	"encoding/json"
+	"html"
+	"text/template"
+)
+
+// pageTemplate 是点名页面的完整 HTML。占位符：
+//
+//	{{.Class}}      班级名称（已做 HTML 转义）
+//	{{.Version}}    版本号
+//	{{.StudentsJS}} 姓名数组，已是合法 JS 字面量
+const pageTemplate = `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{{.Class}}班点名</title>
+<style>
+* {
+margin: 0;
+padding: 0;
+box-sizing: border-box;
+}
+body {
+font-family: 'PingFang SC', 'Microsoft YaHei', 'Segoe UI', sans-serif;
+background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+overflow: hidden;
+height: 100vh;
+display: flex;
+justify-content: center;
+align-items: center;
+position: relative;
+}
+.main-container {
+width: 100vw;
+height: 100vh;
+display: flex;
+flex-direction: column;
+justify-content: center;
+align-items: center;
+position: relative;
+z-index: 1;
+padding: 20px;
+}
+.app-title {
+font-size: 36px;
+font-weight: 700;
+color: #fff;
+margin-bottom: 40px;
+text-align: center;
+letter-spacing: 2px;
+text-shadow: 2px 2px 4px rgba(0,0,0,0.2);
+}
+.app-title span {
+color: #ffd93d;
+}
+.name-card {
+width: 80vw;
+height: 30vh;
+max-width: 800px;
+min-height: 180px;
+background-color: #ffffff;
+border-radius: 25px;
+box-shadow: 0 20px 40px rgba(0, 0, 0, 0.1);
+display: flex;
+justify-content: center;
+align-items: center;
+margin-bottom: 50px;
+position: relative;
+overflow: hidden;
+transition: all 0.3s ease;
+border: none;
+}
+.name-card:hover {
+transform: translateY(-5px);
+box-shadow: 0 25px 50px rgba(0, 0, 0, 0.15);
+}
+.name-card.bounce {
+animation: bounce 0.5s cubic-bezier(0.68, -0.55, 0.265, 1.55);
+}
+@keyframes bounce {
+0% { transform: scale(1); }
+30% { transform: scale(1.01); }
+50% { transform: scale(0.995); }
+70% { transform: scale(1.005); }
+100% { transform: scale(1); }
+}
+.name-text {
+font-size: 90px;
+font-weight: 800;
+text-align: center;
+white-space: nowrap;
+overflow: hidden;
+text-overflow: ellipsis;
+padding: 0 40px;
+letter-spacing: 2px;
+background: linear-gradient(
+90deg,
+#2c3e50 0%,
+#2c3e50 25%,
+#3498db 50%,
+#e74c3c 75%,
+#2c3e50 100%
+);
+background-size: 200% auto;
+-webkit-background-clip: text;
+background-clip: text;
+-webkit-text-fill-color: transparent;
+animation: textShine 3s linear infinite;
+}
+@keyframes textShine {
+0% { background-position: 0% center; }
+100% { background-position: 200% center; }
+}
+.roll-card {
+background: white;
+border-radius: 30px;
+box-shadow: 0 20px 40px rgba(0, 0, 0, 0.1);
+display: flex;
+align-items: center;
+justify-content: center;
+padding: 0;
+cursor: pointer;
+user-select: none;
+transition: all 0.3s ease;
+border: none;
+overflow: hidden;
+position: relative;
+}
+.roll-card:hover {
+transform: translateY(-3px);
+box-shadow: 0 25px 50px rgba(0, 0, 0, 0.15);
+}
+.roll-card:active {
+transform: translateY(1px);
+box-shadow: 0 10px 20px rgba(0, 0, 0, 0.1);
+}
+.roll-icon {
+width: 30px;
+height: 30px;
+margin: 15px;
+color: #3498db;
+}
+.roll-text {
+font-size: 20px;
+color: #000000;
+margin: 15px 15px 15px 0;
+font-weight: 600;
+}
+.settings-btn {
+position: absolute;
+top: 40px;
+right: 40px;
+width: 20px;
+height: 20px;
+cursor: pointer;
+color: #7f8c8d;
+transition: all 0.3s ease;
+z-index: 10;
+}
+.settings-btn:hover {
+color: #3498db;
+transform: scale(1.1);
+}
+@media (max-width: 1024px) {
+.name-card { width: 85vw; height: 28vh; }
+.name-text { font-size: 80px; }
+}
+@media (max-width: 768px) {
+.name-card { width: 90vw; height: 25vh; border-radius: 20px; }
+.name-text { font-size: 60px; padding: 0 20px; }
+.app-title { font-size: 28px; margin-bottom: 30px; }
+.roll-text { font-size: 18px; }
+}
+@media (max-width: 480px) {
+.name-card { width: 95vw; height: 22vh; border-radius: 15px; }
+.name-text { font-size: 48px; }
+.app-title { font-size: 24px; margin-bottom: 20px; }
+.roll-text { font-size: 16px; }
+.settings-btn { top: 20px; right: 20px; }
+}
+@media (max-height: 600px) {
+.name-card { height: 35vh; margin-bottom: 30px; }
+.name-text { font-size: 70px; }
+}
+.toast {
+position: fixed;
+bottom: 30px;
+left: 50%;
+transform: translateX(-50%) translateY(100px);
+background: rgba(44, 62, 80, 0.95);
+color: white;
+padding: 15px 30px;
+border-radius: 25px;
+font-size: 16px;
+font-weight: 500;
+opacity: 0;
+transition: transform 0.3s, opacity 0.3s;
+z-index: 1000;
+box-shadow: 0 10px 25px rgba(0, 0, 0, 0.2);
+backdrop-filter: blur(10px);
+}
+.toast.show {
+transform: translateX(-50%) translateY(0);
+opacity: 1;
+}
+.loading {
+display: inline-block;
+width: 20px;
+height: 20px;
+border: 3px solid rgba(52, 152, 219, 0.3);
+border-radius: 50%;
+border-top-color: #3498db;
+animation: spin 1s ease-in-out infinite;
+margin-right: 10px;
+}
+@keyframes spin {
+to { transform: rotate(360deg); }
+}
+.controls {
+display: flex;
+gap: 20px;
+margin-top: 20px;
+}
+.control-btn {
+padding: 12px 30px;
+font-size: 18px;
+border: none;
+border-radius: 12px;
+background: #fff;
+color: #333;
+cursor: pointer;
+transition: all 0.3s ease;
+font-weight: 600;
+box-shadow: 0 4px 15px rgba(0, 0, 0, 0.1);
+}
+.control-btn:hover {
+transform: translateY(-2px);
+box-shadow: 0 6px 20px rgba(0, 0, 0, 0.15);
+}
+.control-btn:active {
+transform: translateY(1px);
+}
+#startStopBtn {
+background: linear-gradient(135deg, #3498db, #2980b9);
+color: white;
+}
+#resetBtn {
+background: linear-gradient(135deg, #e74c3c, #c0392b);
+color: white;
+}
+.info-text {
+color: rgba(255, 255, 255, 0.8);
+margin-top: 20px;
+font-size: 14px;
+}
+</style>
+</head>
+<body>
+<div class="main-container">
+<span style="color: rgba(201, 208, 244, 1.0); text-align: center;">version {{.Version}}</span>
+<h1 class="app-title"><span id="classNum">{{.Class}}</span>班点名</h1>
+<div class="name-card" id="nameCard">
+<div class="name-text" id="currentName">准备就绪</div>
+</div>
+<div class="controls">
+<button class="control-btn" id="startStopBtn">开始点名</button>
+<button class="control-btn" id="resetBtn">重置名单</button>
+</div>
+<div class="info-text" id="remainText">剩余 0 / 0 人</div>
+<div style="color: rgba(255, 255, 255, 0.6); font-size: 14px; margin-top: 20px; text-align: center;">
+by 白异山
+</div>
+</div>
+<div class="toast" id="toast"></div>
+<script>
+let originalStudents = {{.StudentsJS}};
+let students = [...originalStudents];
+let currentIndex = 0;
+let isRolling = false;
+let rollInterval = null;
+let rollSpeed = 5;
+const nameDisplay = document.getElementById('currentName');
+const nameCard = document.getElementById('nameCard');
+const startStopBtn = document.getElementById('startStopBtn');
+const resetBtn = document.getElementById('resetBtn');
+const remainText = document.getElementById('remainText');
+function shuffleArray(array) {
+for (let i = array.length - 1; i > 0; i--) {
+const j = Math.floor(Math.random() * (i + 1));
+[array[i], array[j]] = [array[j], array[i]];
+}
+return array;
+}
+function updateRemain() {
+remainText.textContent = '剩余 ' + students.length + ' / ' + originalStudents.length + ' 人';
+}
+function resetStudents() {
+if (isRolling) {
+clearInterval(rollInterval);
+isRolling = false;
+startStopBtn.textContent = '开始点名';
+startStopBtn.style.background = 'linear-gradient(135deg, #3498db, #2980b9)';
+}
+students = shuffleArray([...originalStudents]);
+currentIndex = 0;
+nameDisplay.textContent = '准备就绪';
+updateRemain();
+}
+function showToast(msg) {
+const toast = document.getElementById('toast');
+toast.textContent = msg;
+toast.classList.add('show');
+clearTimeout(showToast.timer);
+showToast.timer = setTimeout(() => {
+toast.classList.remove('show');
+}, 1800);
+}
+students = shuffleArray([...students]);
+updateRemain();
+resetBtn.addEventListener('click', function() {
+resetStudents();
+showToast('名单已重置，共 ' + students.length + ' 人');
+});
+startStopBtn.addEventListener('click', function() {
+if (isRolling) {
+clearInterval(rollInterval);
+startStopBtn.textContent = '开始点名';
+startStopBtn.style.background = 'linear-gradient(135deg, #3498db, #2980b9)';
+isRolling = false;
+const selectedName = students[currentIndex];
+nameDisplay.textContent = selectedName;
+nameCard.classList.add('bounce');
+setTimeout(() => {
+nameCard.classList.remove('bounce');
+}, 300);
+if (selectedName && students.length > 0) {
+const indexToRemove = students.indexOf(selectedName);
+if (indexToRemove !== -1) {
+students.splice(indexToRemove, 1);
+if (students.length === 0) {
+students = shuffleArray([...originalStudents]);
+showToast('全部点完，名单已重置');
+}
+if (currentIndex >= students.length) {
+currentIndex = 0;
+}
+}
+updateRemain();
+}
+} else {
+if (students.length === 0) {
+alert("该名单无效，请重新获取");
+return;
+}
+currentIndex = 0;
+startStopBtn.textContent = '停止点名';
+startStopBtn.style.background = 'linear-gradient(135deg, #e74c3c, #c0392b)';
+isRolling = true;
+rollInterval = setInterval(() => {
+nameDisplay.textContent = students[currentIndex];
+currentIndex = (currentIndex + 1) % students.length;
+}, rollSpeed);
+}
+});
+window.addEventListener('load', function() {
+if(students.length > 1) {
+currentIndex = 0;
+} else {
+alert("该名单无效，请重新获取");
+}
+});
+</script>
+</body>
+</html>
+`
+
+var pageTmpl = template.Must(template.New("page").Parse(pageTemplate))
+
+// renderPage 生成最终页面；姓名以 JSON 数组的形式注入，避免引号 / 反斜杠破坏脚本。
+func renderPage(className string, students []string) ([]byte, error) {
+	names, err := json.Marshal(students)
+	if err != nil {
+		return nil, err
+	}
+	var buf bytes.Buffer
+	data := struct {
+		Class      string
+		Version    string
+		StudentsJS string
+	}{
+		Class:      html.EscapeString(className),
+		Version:    html.EscapeString(version),
+		StudentsJS: string(names),
+	}
+	if err := pageTmpl.Execute(&buf, data); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}

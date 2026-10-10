@@ -1,0 +1,19 @@
+# 编译产物
+dist/
+*.exe
+
+# 图标源图——想改图标再放回来跑 make-icon.py
+# assets/icon-source.png
+
+# 学生真实名单：绝对不要提交！用 p.sample.txt 当示例
+p.txt
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# 本机临时文件
+DMING*.html
