@@ -85,36 +85,81 @@ jobs:
           if not exist dist mkdir dist
           go build -trimpath -ldflags "-s -w" -o dist/dming-windows-arm64.exe .
 
+      # 注意：Windows 上这两步的脚本必须是纯 ASCII。
+      # GitHub Actions 把 run 块写成 UTF-8 文件，而 Windows PowerShell 5.1
+      # 读无 BOM 的 .ps1 时按系统 ANSI 代码页解码，中文会变成
+      # 「exe é‡Œæ²¡æœ‰...」这种乱码并直接语法报错。cmd.exe 同理（用 OEM 代码页）。
+      # 要用中文就得走 pwsh（PowerShell 7，默认按 UTF-8 读脚本）。
       - name: 确认图标真的嵌进去了
         shell: powershell
         run: |
+          # NOTE: this script is ASCII-only on purpose, see the comment above.
+          #
+          # Do NOT use ExtractAssociatedIcon to test for an icon: when a file has
+          # no icon resource, Windows hands back the generic application icon
+          # rather than $null, so such a test would always pass.
+          # Parse the PE section table instead and require a .rsrc section --
+          # the Go linker only emits that section when a rsrc_*.syso is linked.
+          $exe = (Resolve-Path dist\dming-windows-amd64.exe).Path
+          $fs = [IO.File]::OpenRead($exe)
+          $br = New-Object IO.BinaryReader($fs)
+          try {
+            $fs.Position = 0x3C
+            $peOff = $br.ReadInt32()
+            $fs.Position = $peOff + 6
+            $numSections = $br.ReadUInt16()
+            $fs.Position = $peOff + 20
+            $optSize = $br.ReadUInt16()
+            $sectOff = $peOff + 24 + $optSize
+            $names = @()
+            for ($i = 0; $i -lt $numSections; $i++) {
+              $fs.Position = $sectOff + $i * 40
+              $names += ([Text.Encoding]::ASCII.GetString($br.ReadBytes(8))).TrimEnd([char]0)
+            }
+          } finally {
+            $fs.Close()
+          }
+
+          Write-Host "PE sections: $($names -join ', ')"
+          if ($names -notcontains '.rsrc') {
+            throw "no .rsrc section found -- the icon was NOT linked into the exe"
+          }
+          Write-Host "OK: .rsrc present, the icon resource really is embedded"
+
           Add-Type -AssemblyName System.Drawing
-          $ico = [System.Drawing.Icon]::ExtractAssociatedIcon((Resolve-Path dist\dming-windows-amd64.exe))
-          if ($null -eq $ico) { throw "exe 里没有图标资源" }
-          Write-Host "图标尺寸: $($ico.Width)x$($ico.Height)"
-          # 顺便确认产物能跑起来（-h 会打印用法并返回 2，不算失败）
-          $out = & .\dist\dming-windows-amd64.exe -h 2>&1 | Out-String
-          Write-Host "--- exe -h 输出 ---"
-          Write-Host $out
+          $ico = [System.Drawing.Icon]::ExtractAssociatedIcon($exe)
+          Write-Host "Extracted icon size: $($ico.Width)x$($ico.Height)"
+
+          # Smoke test: -h prints usage and exits 2, which is expected here.
+          Write-Host "--- exe -h output ---"
+          & $exe -h 2>&1 | Out-String | Write-Host
 
       - name: 组一个免安装绿色版
-        shell: cmd
+        shell: pwsh
         run: |
-          mkdir dist\dming-portable
-          copy dist\dming-windows-amd64.exe dist\dming-portable\dming.exe
-          copy class.txt dist\dming-portable\
-          copy p.sample.txt dist\dming-portable\p.txt
-          echo 免安装版，解压即用。> dist\dming-portable\使用说明.txt
-          echo.>> dist\dming-portable\使用说明.txt
-          echo 1. 把 p.txt 换成你的名单（每行一个姓名）。>> dist\dming-portable\使用说明.txt
-          echo 2. 班级名称写在 class.txt 里。>> dist\dming-portable\使用说明.txt
-          echo 3. 双击 dming.exe 即可点名，页面会用默认浏览器打开。>> dist\dming-portable\使用说明.txt
-          echo.>> dist\dming-portable\使用说明.txt
-          echo 命令行参数：>> dist\dming-portable\使用说明.txt
-          echo   dming.exe -keep       保留生成的 HTML，不自动删除>> dist\dming-portable\使用说明.txt
-          echo   dming.exe -no-open    只生成 HTML，不打开浏览器>> dist\dming-portable\使用说明.txt
-          echo.>> dist\dming-portable\使用说明.txt
-          echo 注意 p.txt 和 class.txt 必须和 dming.exe 放在同一个文件夹。>> dist\dming-portable\使用说明.txt
+          New-Item -ItemType Directory -Force -Path dist/dming-portable | Out-Null
+          Copy-Item dist/dming-windows-amd64.exe dist/dming-portable/dming.exe
+          Copy-Item class.txt   dist/dming-portable/
+          Copy-Item p.sample.txt dist/dming-portable/p.txt
+          Copy-Item assets/dming.ico dist/dming-portable/
+
+          $readme = @'
+          免安装版，解压即用。
+
+          1. 把 p.txt 换成你的名单（每行一个姓名）。
+          2. 班级名称写在 class.txt 里。
+          3. 双击 dming.exe 即可点名，页面会用默认浏览器打开。
+
+          命令行参数：
+            dming.exe -keep        保留生成的 HTML，不自动删除
+            dming.exe -no-open     只生成 HTML，不打开浏览器
+            dming.exe -delay 8s    延长清理前的等待时间
+
+          注意 p.txt 和 class.txt 必须和 dming.exe 放在同一个文件夹里。
+          '@
+          # pwsh 的 utf8 是无 BOM 的 UTF-8，记事本可以正常识别。
+          Set-Content -Path 'dist/dming-portable/使用说明.txt' -Value $readme -Encoding utf8
+          Get-ChildItem dist/dming-portable | Format-Table Name, Length
 
       - name: 列出产物
         shell: cmd
@@ -122,14 +167,34 @@ jobs:
 
       # 打成两个 zip，给 Release 用（Actions 的 Artifacts 会再包一层 zip，
       # 发布时直接给这两个更清爽）。
+      # 用 pwsh 而不是 powershell：绿色版里有中文文件名，
+      # PowerShell 5.1 在 zip 条目编码上会出问题，pwsh（.NET Core）不会。
       - name: 打包发布用 zip
-        shell: powershell
+        shell: pwsh
         run: |
-          Compress-Archive -Path dist\dming-portable\* `
-            -DestinationPath dist\dming-windows-portable.zip -Force
-          Compress-Archive -Path dist\dming-windows-amd64.exe, dist\dming-windows-arm64.exe `
-            -DestinationPath dist\dming-windows-exe.zip -Force
-          Get-ChildItem dist\*.zip | Format-Table Name, Length
+          Compress-Archive -Path dist/dming-portable/* `
+            -DestinationPath dist/dming-windows-portable.zip -Force
+          Compress-Archive -Path dist/dming-windows-amd64.exe, dist/dming-windows-arm64.exe `
+            -DestinationPath dist/dming-windows-exe.zip -Force
+
+          # 把 zip 里的条目标题读回来核一遍。名字要是坏了就让 job 直接失败，
+          # 而不是把乱码文件名的包发出去。
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zipPath = (Resolve-Path dist/dming-windows-portable.zip).Path
+          $zip = [IO.Compression.ZipFile]::OpenRead($zipPath)
+          try {
+            $entries = @($zip.Entries | ForEach-Object { $_.FullName })
+          } finally {
+            $zip.Dispose()
+          }
+          Write-Host "portable zip entries:"
+          $entries | ForEach-Object { Write-Host "  $_" }
+          if ($entries -notcontains '使用说明.txt') {
+            throw "zip entry name came back mangled; expected 使用说明.txt"
+          }
+          Write-Host "OK: entry names survived the round trip"
+
+          Get-ChildItem dist/*.zip | Format-Table Name, Length
 
       - uses: actions/upload-artifact@v4
         with:

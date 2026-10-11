@@ -194,6 +194,34 @@ git tag "$(git rev-parse --short=7 HEAD)" && git push origin --tags
   `setup-go` 会直接失败。
 - `dist/`、`*.exe`、`*.syso` 都在 `.gitignore` 里，构建产物不会污染仓库。
 
+#### Windows 上 inline 脚本的编码是个坑
+
+GitHub Actions 会把 `run:` 块写成**无 BOM 的 UTF-8** 文件。而：
+
+| shell | 怎么读脚本 | 中文会怎样 |
+|---|---|---|
+| `cmd` | OEM 代码页（英文 runner 上是 cp437） | **乱码**，还会写坏重定向的文件 |
+| `powershell`（5.1） | 无 BOM 时按系统 ANSI 代码页 | **乱码**，直接语法报错 |
+| `pwsh`（PowerShell 7） | 默认 UTF-8 | 正常 ✓ |
+| `bash`（Ubuntu runner） | 默认 UTF-8 | 正常 ✓ |
+
+踩过的具体报错长这样，`exe 里没有图标资源` 被读成了 `exe é‡Œæ²¡æœ‰å›¾æ ‡èµ„æº`：
+
+```
+Unexpected token 'æº"' in expression or statement.
+The string is missing the terminator: ".
+```
+
+所以约定是：
+
+- **`cmd` / `powershell` 的 `run:` 块一律纯 ASCII**（步骤名 `name:` 是元数据，不受影响，
+  中文照写）。
+- **需要中文就换 `pwsh`**。绿色版的中文 `使用说明.txt` 就是 `pwsh` + `Set-Content -Encoding utf8`
+  写出来的。
+- zip 里带中文文件名有额外的编码风险，所以打完包会用
+  `System.IO.Compression.ZipFile` 把条目标题**读回来核对**，名字坏了就让 job 直接失败，
+  而不是把乱码文件名的包发出去。
+
 ### 为什么不做安装包
 
 一开始用 Inno Setup 打了安装包，但坑太多：
