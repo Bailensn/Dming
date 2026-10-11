@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""从 assets/icon-source.png 生成 assets/dming.ico 与 assets/dming.png。
+"""从 assets/icon-source.png 生成 assets/dming.ico。
 
-icon-source.png 是 Dming.webp 里的一帧整幅关键帧（620x620、带 alpha 的 RGBA），
-见 README 的「图标」一节。想换图标时：把新的正方形 PNG 覆盖成 icon-source.png，
-再跑一次本脚本即可。
+icon-source.png 是一张 620x620、带 alpha 的正方形 PNG（最初从一张动图里抽出来的
+第 15 帧）。想换图标时：把新的正方形 PNG 覆盖成 icon-source.png，再跑一次本脚本。
 
 只依赖标准库，不需要 Pillow。ICO 里全部用 BMP/DIB 条目（不用 PNG 压缩条目），
 兼容性最好 —— 某些图标解析器不认 ICO 内嵌 PNG。
@@ -14,7 +13,6 @@ import struct
 import zlib
 
 SIZES = [16, 24, 32, 48, 64, 128, 256]
-PREVIEW_SIZE = 256
 
 
 # --------------------------------------------------------------------------
@@ -147,24 +145,6 @@ def write_ico(path, images):
         f.write(directory + blobs)
 
 
-def write_png(path, px, size):
-    raw = bytearray()
-    for y in range(size):
-        raw.append(0)
-        raw += px[y * size * 4:(y + 1) * size * 4]
-
-    def chunk(tag, body):
-        payload = tag + body
-        return (struct.pack('>I', len(body)) + payload
-                + struct.pack('>I', zlib.crc32(payload) & 0xFFFFFFFF))
-
-    with open(path, 'wb') as f:
-        f.write(b'\x89PNG\r\n\x1a\n'
-                + chunk(b'IHDR', struct.pack('>IIBBBBB', size, size, 8, 6, 0, 0, 0))
-                + chunk(b'IDAT', zlib.compress(bytes(raw), 9))
-                + chunk(b'IEND', b''))
-
-
 def main():
     here = os.path.dirname(os.path.abspath(__file__))
     src_path = os.path.join(here, 'icon-source.png')
@@ -176,8 +156,6 @@ def main():
     for size in SIZES:
         px = src if size == sw else resize_area(src, sw, sh, size, size)
         images.append((size, bmp_entry(px, size)))
-        if size == PREVIEW_SIZE:
-            write_png(os.path.join(here, 'dming.png'), px, size)
 
     ico = os.path.join(here, 'dming.ico')
     write_ico(ico, images)
@@ -185,7 +163,6 @@ def main():
     print('已生成 %s —— %d 个尺寸: %s，共 %d 字节'
           % (ico, len(SIZES), ', '.join(str(s) for s in SIZES),
              os.path.getsize(ico)))
-    print('已生成 %s' % os.path.join(here, 'dming.png'))
 
 
 if __name__ == '__main__':

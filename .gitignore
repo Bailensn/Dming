@@ -1,11 +1,9 @@
 # 编译产物
 dist/
 *.exe
+*.syso
 
-# 图标源图——想改图标再放回来跑 make-icon.py
-# assets/icon-source.png
-
-# 学生真实名单：绝对不要提交！用 p.sample.txt 当示例
+# 学生真实名单：绝对不要提交！仓库里用 p.sample.txt 当示例
 p.txt
 
 # 编辑器 / 系统
@@ -15,8 +13,5 @@ p.txt
 .DS_Store
 Thumbs.db
 
-# 本机临时文件
+# 运行时的临时页面
 DMING*.html
-
-# rsrc 生成的图标资源（构建时现生成）
-*.syso

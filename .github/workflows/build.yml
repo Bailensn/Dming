@@ -1,16 +1,30 @@
 name: build
 
 # 什么时候跑：
-#   - 推送到 main / master
+#   - 推送到 main / master  -> 只构建，产物在 Actions 的 Artifacts 里
+#   - 打 tag                -> 构建并自动发一个 Release
 #   - 手动：仓库页面 Actions -> build -> Run workflow
-#   - 打 v* 标签时也会跑（产物在 Actions 里照样能下）
+#
+# 发版流程（手动，避免每次改错字都发版）。
+# tag 名就是提交的 7 位短 SHA，不带任何前缀：
+#   git tag 56ad711
+#   git push origin 56ad711
+#
+# 省事写法，直接用当前提交：
+#   git tag "$(git rev-parse --short=7 HEAD)" && git push origin --tags
+#
+# 触发器用 [0-9a-f]* 匹配十六进制短 SHA。
+# 注意这只能保证「看起来像 SHA」，不校验它是否真是本仓库的提交 ——
+# 打错 tag 名的话 release job 里的校验会兜住并报错。
 on:
   push:
     branches: [main, master]
-    tags: ['v*']
+    tags: ['[0-9a-f]*']
   pull_request:
   workflow_dispatch:
 
+# 默认只读；发 Release 需要写权限，在 release job 里单独提权，
+# 避免把这个权限给到跑第三方 action 的构建 job。
 permissions:
   contents: read
 
@@ -106,6 +120,17 @@ jobs:
         shell: cmd
         run: dir /b dist
 
+      # 打成两个 zip，给 Release 用（Actions 的 Artifacts 会再包一层 zip，
+      # 发布时直接给这两个更清爽）。
+      - name: 打包发布用 zip
+        shell: powershell
+        run: |
+          Compress-Archive -Path dist\dming-portable\* `
+            -DestinationPath dist\dming-windows-portable.zip -Force
+          Compress-Archive -Path dist\dming-windows-amd64.exe, dist\dming-windows-arm64.exe `
+            -DestinationPath dist\dming-windows-exe.zip -Force
+          Get-ChildItem dist\*.zip | Format-Table Name, Length
+
       - uses: actions/upload-artifact@v4
         with:
           name: dming-windows
@@ -114,6 +139,7 @@ jobs:
             dist/dming-windows-amd64.exe
             dist/dming-windows-arm64.exe
             dist/dming-portable/
+            dist/*.zip
 
   # ---------------------------------------------------------------------------
   # 顺带交叉编译其他平台，跟 Windows 产物一起在 Actions 页面下载。
@@ -154,3 +180,123 @@ jobs:
           name: dming-${{ matrix.goos }}-${{ matrix.goarch }}
           if-no-files-found: error
           path: dist/dming-${{ matrix.goos }}-${{ matrix.goarch }}
+
+  # ---------------------------------------------------------------------------
+  # 打 tag 时，把上面所有产物汇总成一个 Release。
+  #
+  # 只在 tag 上跑：普通 push 到 main 只构建，不发版。
+  #
+  # tag 约定是「提交的 7 位短 SHA」。这里会校验它确实对应本仓库的某个提交，
+  # 并且是 HEAD 的祖先 —— 打错名字（比如手抖打成 56ad71）会直接报错，
+  # 而不是发一个指向不存在提交的 Release。
+  # ---------------------------------------------------------------------------
+  release:
+    name: 发布 Release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [windows, cross]
+    runs-on: ubuntu-latest
+    permissions:
+      # 建 Release 需要写权限，只给这个 job。
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # 取完整历史，下面要按 SHA 反查提交信息。
+          fetch-depth: 0
+
+      - name: 校验 tag 名是提交短 SHA
+        id: check
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+
+          if ! printf '%s' "$TAG" | grep -qE '^[0-9a-f]{4,40}$'; then
+            echo "::error::tag 名 '$TAG' 不是十六进制短 SHA"
+            exit 1
+          fi
+
+          # 反查这个短 SHA 对应的完整提交。找不到会非零退出。
+          if ! FULL="$(git rev-parse --verify --quiet "${TAG}^{commit}")"; then
+            echo "::error::tag 名 '$TAG' 在本仓库里找不到对应的提交，请检查是否打错"
+            exit 1
+          fi
+
+          SHORT="$(git rev-parse --short=7 "$FULL")"
+          echo "tag=$TAG"
+          echo "完整 SHA=$FULL"
+          echo "规范化短 SHA=$SHORT"
+          echo "full=$FULL" >> "$GITHUB_OUTPUT"
+          echo "short=$SHORT" >> "$GITHUB_OUTPUT"
+
+      - name: 下载全部构建产物
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      # 下载下来的目录结构是 artifacts/<artifact名>/<文件>。
+      # 这里把要发布的东西挑出来，摊平到 release/ 下。
+      - name: 整理发布文件
+        run: |
+          set -eux
+          mkdir -p release
+          # Windows 绿色版和 exe 合集
+          cp artifacts/dming-windows/dming-windows-portable.zip release/
+          cp artifacts/dming-windows/dming-windows-exe.zip release/
+          # 其他平台，各自一个二进制
+          for dir in artifacts/dming-linux-* artifacts/dming-darwin-* artifacts/dming-android-*; do
+            [ -d "$dir" ] || continue
+            for f in "$dir"/*; do
+              [ -f "$f" ] && cp "$f" release/
+            done
+          done
+          echo "--- 待发布文件 ---"
+          ls -la release/
+
+      - name: 生成 Release 说明
+        env:
+          FULL_SHA: ${{ steps.check.outputs.full }}
+        run: |
+          set -euo pipefail
+          SUBJECT="$(git log -1 --pretty=%s "$FULL_SHA")"
+          BODY="$(git log -1 --pretty=%b "$FULL_SHA")"
+          AUTHOR="$(git log -1 --pretty=%an "$FULL_SHA")"
+          DATE="$(git log -1 --pretty=%ad --date=short "$FULL_SHA")"
+
+          {
+            echo "提交 \`$FULL_SHA\` —— $DATE by $AUTHOR"
+            echo
+            echo "**$SUBJECT**"
+            echo
+            if [ -n "$BODY" ]; then
+              echo "$BODY"
+              echo
+            fi
+            echo "## 下载哪个"
+            echo
+            echo "| 文件 | 说明 |"
+            echo "|---|---|"
+            echo "| \`dming-windows-portable.zip\` | **推荐**。解压即用，把 \`p.txt\` 换成你的名单，双击 \`dming.exe\` |"
+            echo "| \`dming-windows-exe.zip\` | 只要 exe（amd64 / arm64 两个），自己配 \`p.txt\`、\`class.txt\` |"
+            echo "| \`dming-darwin-arm64\` / \`dming-darwin-amd64\` | macOS（Apple 芯片 / Intel） |"
+            echo "| \`dming-linux-amd64\` / \`dming-linux-arm64\` | Linux |"
+            echo "| \`dming-android-arm64\` | Termux |"
+            echo
+            echo "> macOS / Linux 首次运行可能需要去掉隔离属性："
+            echo "> \`chmod +x dming-* && xattr -d com.apple.quarantine dming-darwin-arm64\`"
+            echo
+            echo "绿色版里的 \`p.txt\` 是示例名单（张三、李四、王五、赵六），不含任何真实数据。"
+          } > release_body.md
+
+          echo "--- 说明预览 ---"
+          cat release_body.md
+
+      - name: 创建 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ steps.check.outputs.short }}
+          tag_name: ${{ github.ref_name }}
+          body_path: release_body.md
+          files: release/*
+          draft: false
+          prerelease: false
+          fail_on_unmatched_files: true
