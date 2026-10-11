@@ -33,6 +33,7 @@ call :build %~1 %~2
 goto :done
 
 :buildall
+rem 64-bit
 call :build windows amd64
 if errorlevel 1 goto :fail
 call :build windows arm64
@@ -46,6 +47,16 @@ if errorlevel 1 goto :fail
 call :build darwin arm64
 if errorlevel 1 goto :fail
 call :build android arm64
+if errorlevel 1 goto :fail
+rem 32-bit
+rem Go has no windows/arm (32-bit ARM Windows), and no 32-bit darwin at all.
+call :build windows 386
+if errorlevel 1 goto :fail
+call :build linux 386
+if errorlevel 1 goto :fail
+call :build linux arm
+if errorlevel 1 goto :fail
+call :build android arm
 if errorlevel 1 goto :fail
 
 :done

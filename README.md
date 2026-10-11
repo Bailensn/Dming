@@ -41,8 +41,23 @@ build.bat                   :: 全部平台
 build.bat windows amd64     :: 只编一个
 ```
 
-覆盖的平台：`windows/amd64`、`windows/arm64`、`darwin/amd64`、`darwin/arm64`、
-`linux/amd64`、`linux/arm64`、`android/arm64`（Termux）。
+覆盖的平台：
+
+| 64 位 | 32 位 |
+|---|---|
+| `windows/amd64`、`windows/arm64` | `windows/386` |
+| `darwin/amd64`、`darwin/arm64` | —— |
+| `linux/amd64`、`linux/arm64` | `linux/386`、`linux/arm` |
+| `android/arm64`（Termux） | `android/arm`（32 位 Android / 老 Termux） |
+
+三点说明：
+
+- **`windows/arm` 不存在** —— Go 没有这个 port。Windows 上只有 `386` / `amd64` /
+  `arm64` 三种，所以 32 位 Windows 就是 `windows/386`。
+- **`darwin` 没有 32 位** —— Go 1.15 就移除了 `darwin/386` 和 `darwin/arm`，
+  macOS 从 10.15 起也不再支持 32 位程序。
+- `linux/arm` 默认按 `GOARM=7` 编译。要给更老的 ARMv6 设备（树莓派 1 / Zero）用，
+  得加 `GOARM=6` 重新编译。
 
 ### exe 图标（Windows）
 

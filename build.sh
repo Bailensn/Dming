@@ -16,6 +16,7 @@ OUT="dist"
 PKG="."
 
 TARGETS=(
+	# 64 位
 	"linux/amd64"
 	"linux/arm64"
 	"darwin/amd64"
@@ -23,7 +24,18 @@ TARGETS=(
 	"windows/amd64"
 	"windows/arm64"
 	"android/arm64" # Termux
+	# 32 位
+	"linux/386"
+	"linux/arm"
+	"windows/386"
+	"android/arm"
 )
+
+# 说明：
+#   - 想给 windows 产物嵌图标，先跑 rsrc 生成 rsrc_windows_<arch>.syso，
+#     详见 README 的「exe 图标（Windows）」。
+#   - Go 不支持 windows/arm（32 位 ARM Windows），darwin 也没有 32 位。
+#   - linux/arm 默认 GOARM=7；要支持更老的 ARMv6 设备就设 GOARM=6 重建。
 
 if [ "$#" -gt 0 ]; then
 	TARGETS=("$@")
