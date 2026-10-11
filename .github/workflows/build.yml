@@ -297,9 +297,9 @@ jobs:
           # 32 位
           # windows/386 在 windows job 里单独编（要嵌图标），这里不重复。
           # 注意 Go 没有 windows/arm（32 位 ARM Windows），darwin 也早就没有 32 位。
+          # 也不要 android/arm —— 32 位 Android 设备现在基本见不到了。
           - { goos: linux,   goarch: '386' }   # 32 位 x86 Linux
           - { goos: linux,   goarch: arm }     # 32 位 ARM（树莓派 32 位系统等）
-          - { goos: android, goarch: arm }     # 32 位 Android / Termux 老设备
     steps:
       - uses: actions/checkout@v4
 
@@ -438,7 +438,7 @@ jobs:
             echo "| \`dming-darwin-arm64\` / \`dming-darwin-amd64\` | macOS（Apple 芯片 / Intel） |"
             echo "| \`dming-linux-amd64\` / \`dming-linux-arm64\` | Linux 64 位 |"
             echo "| \`dming-linux-386\` / \`dming-linux-arm\` | Linux 32 位（x86 / ARM） |"
-            echo "| \`dming-android-arm64\` / \`dming-android-arm\` | Termux（64 位 / 32 位） |"
+            echo "| \`dming-android-arm64\` | Termux（64 位 ARM） |"
             echo
             echo "绿色版里有两个备用 exe：32 位系统用 \`dming-386.exe\`，ARM64 设备用 \`dming-arm64.exe\`。"
             echo

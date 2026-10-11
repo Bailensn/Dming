@@ -28,7 +28,6 @@ TARGETS=(
 	"linux/386"
 	"linux/arm"
 	"windows/386"
-	"android/arm"
 )
 
 # 说明：

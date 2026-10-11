@@ -48,14 +48,17 @@ build.bat windows amd64     :: 只编一个
 | `windows/amd64`、`windows/arm64` | `windows/386` |
 | `darwin/amd64`、`darwin/arm64` | —— |
 | `linux/amd64`、`linux/arm64` | `linux/386`、`linux/arm` |
-| `android/arm64`（Termux） | `android/arm`（32 位 Android / 老 Termux） |
+| `android/arm64`（Termux） | —— |
 
-三点说明：
+四点说明：
 
 - **`windows/arm` 不存在** —— Go 没有这个 port。Windows 上只有 `386` / `amd64` /
   `arm64` 三种，所以 32 位 Windows 就是 `windows/386`。
 - **`darwin` 没有 32 位** —— Go 1.15 就移除了 `darwin/386` 和 `darwin/arm`，
   macOS 从 10.15 起也不再支持 32 位程序。
+- **不编 `android/arm`** —— 32 位 Android 设备现在基本见不到了，只保留 `android/arm64`。
+  注意 Termux 必须用 `android/*` 而不是 `linux/*`：Android 内核拒绝非 PIE 的
+  `linux/arm64` 二进制，而 Go 的 `android/arm64` 默认可执行。
 - `linux/arm` 默认按 `GOARM=7` 编译。要给更老的 ARMv6 设备（树莓派 1 / Zero）用，
   得加 `GOARM=6` 重新编译。
 
@@ -211,7 +214,7 @@ tag 名会被校验，只认十六进制（workflow 里是 `tags: ['[0-9a-f]*']`
 | job | 跑在 | 做的事 |
 |---|---|---|
 | `windows` | `windows-latest` | 装 Go → `rsrc` 生成图标资源 → 编译 amd64/arm64 → 验证图标 → 组绿色版 → 打 zip → 上传 |
-| `cross` | `ubuntu-latest` | 交叉编译 linux / darwin / android 共 5 个目标 |
+| `cross` | `ubuntu-latest` | 交叉编译 linux / darwin / android 共 7 个目标 |
 | `release` | `ubuntu-latest` | **只在 tag 上跑**，汇总所有产物建 Release |
 
 `release` 依赖前两个（`needs: [windows, cross]`），所以只有全部构建成功才会发版，
