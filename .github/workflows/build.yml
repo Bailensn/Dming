@@ -1,24 +1,17 @@
 name: build
 
 # 什么时候跑：
-#   - 推送到 main / master  -> 只构建，产物在 Actions 的 Artifacts 里
-#   - 打 tag                -> 构建并自动发一个 Release
-#   - 手动：仓库页面 Actions -> build -> Run workflow
+#   - 推送到 main / master  -> 构建全部平台，全绿之后【自动发 Release】
+#   - 手动：Actions 页面 Run workflow  -> 同上，也会发 Release
+#   - PR                    -> 只构建验证，不发 Release
+#   - 推 tag                -> 也发，Release 挂在你推的那个 tag 上
 #
-# 发版流程（手动，避免每次改错字都发版）。
-# tag 名就是提交的 7 位短 SHA，不带任何前缀：
-#   git tag 56ad711
-#   git push origin 56ad711
-#
-# 省事写法，直接用当前提交：
-#   git tag "$(git rev-parse --short=7 HEAD)" && git push origin --tags
-#
-# 触发器用 [0-9a-f]* 匹配十六进制短 SHA。
-# 注意这只能保证「看起来像 SHA」，不校验它是否真是本仓库的提交 ——
-# 打错 tag 名的话 release job 里的校验会兜住并报错。
+# 发版是自动的，不用手动打 tag：tag 名就是本次提交的 7 位短 SHA（如 3d462a5），
+# 由 release job 自己算并创建。任何一个平台构建失败，Release 就不会发。
 on:
   push:
     branches: [main, master]
+    # 手动推 tag 也支持（比如想重发某个版本），tag 名仍是短 SHA。
     tags: ['[0-9a-f]*']
   pull_request:
   workflow_dispatch:
@@ -283,50 +276,64 @@ jobs:
           path: dist/dming-${{ matrix.goos }}-${{ matrix.goarch }}
 
   # ---------------------------------------------------------------------------
-  # 打 tag 时，把上面所有产物汇总成一个 Release。
+  # 所有平台都构建成功后，自动把产物汇总成一个 Release。
   #
-  # 只在 tag 上跑：普通 push 到 main 只构建，不发版。
+  # 触发条件就是「windows 和 cross 都成功」—— `needs` 保证这一点：
+  # 任何一个 job 失败或取消，这个 job 都会被跳过，不会发出残缺的 Release。
   #
-  # tag 约定是「提交的 7 位短 SHA」。这里会校验它确实对应本仓库的某个提交，
-  # 并且是 HEAD 的祖先 —— 打错名字（比如手抖打成 56ad71）会直接报错，
-  # 而不是发一个指向不存在提交的 Release。
+  # tag 名 = 本次提交的 7 位短 SHA（如 3d462a5），工作流自己算并创建，不用手动打。
+  # 手动推 tag 也依然有效，那就用你推的那个 tag 名。
+  #
+  # 注意：用 GITHUB_TOKEN 创建的 tag 不会再触发新的 workflow（GitHub 的防递归规则），
+  # 所以不存在自己触发自己的循环。
   # ---------------------------------------------------------------------------
   release:
     name: 发布 Release
-    if: startsWith(github.ref, 'refs/tags/')
     needs: [windows, cross]
+    # PR 只构建不发版；push 和手动 Run workflow 都发。
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     permissions:
-      # 建 Release 需要写权限，只给这个 job。
+      # 建 Release 和 tag 需要写权限，只给这个 job。
       contents: write
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
         with:
           # 取完整历史，下面要按 SHA 反查提交信息。
           fetch-depth: 0
 
-      - name: 校验 tag 名是提交短 SHA
-        id: check
+      - name: 决定 tag 名
+        id: tag
         run: |
           set -euo pipefail
-          TAG="${GITHUB_REF_NAME}"
 
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            # 手动推了 tag，就用它
+            TAG="${GITHUB_REF_NAME}"
+          else
+            # 普通推送：tag 名取本提交的短 SHA
+            TAG="$(git rev-parse --short=7 HEAD)"
+          fi
+
+          # 不管哪种来源都校验一遍，避免发出指向不存在提交的 Release。
           if ! printf '%s' "$TAG" | grep -qE '^[0-9a-f]{4,40}$'; then
             echo "::error::tag 名 '$TAG' 不是十六进制短 SHA"
             exit 1
           fi
-
-          # 反查这个短 SHA 对应的完整提交。找不到会非零退出。
           if ! FULL="$(git rev-parse --verify --quiet "${TAG}^{commit}")"; then
-            echo "::error::tag 名 '$TAG' 在本仓库里找不到对应的提交，请检查是否打错"
+            echo "::error::tag 名 '$TAG' 在本仓库里找不到对应的提交"
             exit 1
           fi
-
+          FULL="$(git rev-parse "$FULL")"
           SHORT="$(git rev-parse --short=7 "$FULL")"
-          echo "tag=$TAG"
-          echo "完整 SHA=$FULL"
-          echo "规范化短 SHA=$SHORT"
-          echo "full=$FULL" >> "$GITHUB_OUTPUT"
+
+          echo "tag        = $TAG"
+          echo "完整 SHA   = $FULL"
+          echo "规范短 SHA = $SHORT"
+          echo "tag=$TAG"     >> "$GITHUB_OUTPUT"
+          echo "full=$FULL"   >> "$GITHUB_OUTPUT"
           echo "short=$SHORT" >> "$GITHUB_OUTPUT"
 
       - name: 下载全部构建产物
@@ -355,7 +362,7 @@ jobs:
 
       - name: 生成 Release 说明
         env:
-          FULL_SHA: ${{ steps.check.outputs.full }}
+          FULL_SHA: ${{ steps.tag.outputs.full }}
         run: |
           set -euo pipefail
           SUBJECT="$(git log -1 --pretty=%s "$FULL_SHA")"
@@ -394,8 +401,10 @@ jobs:
       - name: 创建 Release
         uses: softprops/action-gh-release@v2
         with:
-          name: ${{ steps.check.outputs.short }}
-          tag_name: ${{ github.ref_name }}
+          name: ${{ steps.tag.outputs.short }}
+          tag_name: ${{ steps.tag.outputs.tag }}
+          # tag 由本工作流创建时，钉在这次运行的提交上。
+          target_commitish: ${{ github.sha }}
           body_path: release_body.md
           files: release/*
           draft: false

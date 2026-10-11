@@ -126,52 +126,70 @@ dming -quiet         只输出临时文件路径
 1. 仓库页面 → 顶部 **Actions** 标签
 2. 左侧选 **build**
 3. 想手动触发就点 **Run workflow**（推送时本来就会自动跑）
-4. 等 1～3 分钟，等两个 job 都变绿
-5. 点进跑完的那次运行，页面底部 **Artifacts** 区域下载：
-   - `dming-windows` —— 绿色版文件夹 + 两个架构的 exe
-   - `dming-darwin-arm64` 等其他平台
+4. 等 1～3 分钟，等两个 job 都变绿：**Windows exe** 和 5 个平台的 **cross**
+5. 全绿之后 `release` job 会自动跑起来，**直接发出一个 Release** ——
+   不用再点 Artifacts，去仓库首页右侧的 **Releases** 就能下载
+
+也可以按老办法从 Artifacts 取（构建完就有，不必等 Release）：
+
+- `dming-windows` —— 绿色版文件夹 + 两个架构的 exe
+- `dming-darwin-arm64` 等其他平台
 
 下载得到的是 zip，解压即用。
 
 > 手机上逛 GitHub 网页同样能下：Artifacts 区域点一下就能下 zip。
-> 但**必须先登录**，Artifacts 对未登录用户不可见。
+> 但**必须先登录**，Artifacts 对未登录用户不可见。Releases 页面则不需要登录。
 
-### 发 Release
+### 发 Release：全自动
 
-平时 push 到 main **只构建不发版**，产物在 Artifacts 里。想正式发一个版本时打 tag，
-**tag 名就是提交的 7 位短 SHA，不带任何前缀**：
+**推送到 main 就会自动发版，不需要手动打 tag。**
 
-```bash
-# 看当前提交的短 SHA，例如 56ad711 改为直接分发 exe...
-git log --oneline -1
-
-# 用这个短 SHA 打 tag 并推送
-git tag 56ad711
-git push origin 56ad711
-```
-
-省事写法，直接用当前提交：
+流程是：`windows` 和 `cross` 两个 job 全部构建成功 → `release` job 自动把各平台产物
+汇总成一个 Release。tag 名由工作流自己算，就是本次提交的 **7 位短 SHA**
+（如 `3d462a5`）。
 
 ```bash
-git tag "$(git rev-parse --short=7 HEAD)" && git push origin --tags
+git push origin main     # 就这一条，剩下的全自动
 ```
 
-推上去之后 `release` job 会把前面所有平台的产物汇总成一个 Release，挂在那个 tag 下，
-可以按 tag、按提交直接下载。
+**任何平台构建失败，Release 就不会发。** 这是靠 `needs: [windows, cross]` 实现的 ——
+被依赖的 job 失败或被取消时，`release` job 会被直接跳过，不会发出缺胳膊少腿的版本。
 
-**tag 名会被校验。** workflow 用的是 `tags: ['[0-9a-f]*']`，只认十六进制：
+PR 只构建验证、不发版；手动点 Run workflow 等同于推送到 main，也会发。
+
+> 副作用要心里有数：**每推送一次 main 就产生一个 Release**。改个错别字也会发一个。
+> 如果哪天觉得太吵，可以把 `release` job 的 `if` 改成只在 `workflow_dispatch` 时发，
+> 这样就只有你手动点按钮才发版。
+
+#### 也可以手动推 tag
+
+想重发某个版本，或者给 Release 起个别的名字，手动推 tag 依然有效 ——
+此时 Release 挂在你推的那个 tag 上：
+
+```bash
+git log --oneline -1                              # 看当前短 SHA
+git tag 3d462a5 && git push origin 3d462a5
+```
+
+tag 名会被校验，只认十六进制（workflow 里是 `tags: ['[0-9a-f]*']`）：
 
 | tag 名 | 结果 |
 |---|---|
-| `56ad711` | ✅ 正常发版 |
-| `56ad71` | ✅ 能容忍（git 前缀匹配会补全成 7 位） |
-| `v56ad711` | ❌ 不触发 workflow（`v` 不是十六进制） |
+| `3d462a5` | ✅ 正常发版 |
+| `3d462a` | ✅ 能容忍（git 前缀匹配会补全成 7 位） |
+| `v3d462a5` | ❌ 不触发 workflow（`v` 不是十六进制） |
 | `deadbee` | ❌ 触发但 job 报错：本仓库找不到该提交 |
 | `main` / `HEAD` | ❌ 不触发 |
 
 `deadbee` 这种「长得像 SHA 但仓库里没有」的情况，靠 release job 里的
 `git rev-parse --verify --quiet "${TAG}^{commit}"` 兜住 —— 直接报错，
 而不是发一个指向不存在提交的 Release。
+
+#### 为什么不会自己触发自己
+
+`release` job 用 `GITHUB_TOKEN` 创建 tag。GitHub 有防递归规则：
+**用 `GITHUB_TOKEN` 做的事件不会再触发新的 workflow run**，
+所以自动创建的 tag 不会又拉起一轮构建。
 
 ### 工作流做了什么
 
