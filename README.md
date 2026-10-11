@@ -222,6 +222,31 @@ The string is missing the terminator: ".
   `System.IO.Compression.ZipFile` 把条目标题**读回来核对**，名字坏了就让 job 直接失败，
   而不是把乱码文件名的包发出去。
 
+#### stderr 会让 powershell 步骤直接失败
+
+runner 对 `powershell` / `pwsh` 步骤会预设 `$ErrorActionPreference = 'Stop'`。
+在这种设置下，**原生命令只要往 stderr 写一个字**，PowerShell 就会把它包成
+`NativeCommandError` 并抛成终止性错误，步骤立刻挂：
+
+```
++ & $exe -h 2>&1 | Out-String | Write-Host
++ ~~~~~~~~~~~~~~
+    + CategoryInfo : NotSpecified: (...) []. RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+```
+
+`dming.exe -h` 正好就是这种：Go 的 `flag` 包把用法说明写到 **stderr**（这是惯例，
+不是 bug）。所以冒烟测试改成跑 `dming.exe -no-open`（纯 stdout），
+顺带把测试数据也准备了，验证程序真能读名单、真能出页面：
+
+```powershell
+Set-Content -Path (Join-Path $tmp 'p.txt') -Value "Alice`nBob`nCarol" -Encoding utf8
+& .\dming.exe -no-open
+# 然后断言 DMING*.html 存在，且里面含班级号和三个姓名
+```
+
+这比原来只跑个 `-h` 有用得多 —— 它真的在 Windows 上端到端跑了一遍。
+
 ### 为什么不做安装包
 
 一开始用 Inno Setup 打了安装包，但坑太多：

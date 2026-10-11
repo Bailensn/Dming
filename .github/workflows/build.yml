@@ -130,9 +130,45 @@ jobs:
           $ico = [System.Drawing.Icon]::ExtractAssociatedIcon($exe)
           Write-Host "Extracted icon size: $($ico.Width)x$($ico.Height)"
 
-          # Smoke test: -h prints usage and exits 2, which is expected here.
-          Write-Host "--- exe -h output ---"
-          & $exe -h 2>&1 | Out-String | Write-Host
+      # 真的把程序跑一遍，确认它能读名单、能生成页面。
+      # 注意：这一步必须用 stdout，不能碰 stderr —— runner 对 powershell 步骤
+      # 预设了 $ErrorActionPreference = 'Stop'，原生命令只要往 stderr 写一个字，
+      # 就会被包成 NativeCommandError 直接让步骤失败。
+      # （`dming.exe -h` 的用法说明走的就是 stderr，之前就是这么挂的。）
+      - name: 冒烟测试：跑一遍看能不能出页面
+        shell: powershell
+        run: |
+          # NOTE: ASCII-only, see the comment above.
+          $exe = (Resolve-Path dist\dming-windows-amd64.exe).Path
+          $tmp = Join-Path $env:TEMP 'dming-smoke'
+          if (Test-Path $tmp) { Remove-Item $tmp -Recurse -Force }
+          New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+
+          Copy-Item $exe (Join-Path $tmp 'dming.exe')
+          Set-Content -Path (Join-Path $tmp 'p.txt')     -Value "Alice`nBob`nCarol" -Encoding utf8
+          Set-Content -Path (Join-Path $tmp 'class.txt') -Value '14'                -Encoding utf8
+          Write-Host "test data: $(Get-Content (Join-Path $tmp 'p.txt') -Raw)"
+
+          Push-Location $tmp
+          try {
+            & .\dming.exe -no-open | Write-Host
+          } finally {
+            Pop-Location
+          }
+
+          $page = @(Get-ChildItem $tmp -Filter 'DMING*.html')
+          if ($page.Count -ne 1) {
+            throw "expected exactly one DMING*.html page, got $($page.Count)"
+          }
+          Write-Host "OK: generated $($page[0].Name) ($($page[0].Length) bytes)"
+
+          $html = Get-Content $page[0].FullName -Raw
+          foreach ($needle in @('14', 'Alice', 'Bob', 'Carol')) {
+            if ($html -notmatch [regex]::Escape($needle)) {
+              throw "generated page is missing '$needle'"
+            }
+          }
+          Write-Host "OK: page contains the class number and all three names"
 
       - name: 组一个免安装绿色版
         shell: pwsh
