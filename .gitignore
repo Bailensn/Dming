@@ -1,0 +1,17 @@
+# 编译产物
+dist/
+*.exe
+*.syso
+
+# 学生真实名单：绝对不要提交！仓库里用 p.sample.txt 当示例
+p.txt
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# 运行时的临时页面
+DMING*.html
