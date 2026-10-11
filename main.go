@@ -23,8 +23,8 @@ import (
 	"time"
 )
 
-// version 显示在点名页面左上角，可按需修改。
-const version = "3.4"
+// version 显示在点名页面左上角，也出现在命令行帮助里。
+const version = "3.4.3"
 
 func main() {
 	normalizeArgs()
