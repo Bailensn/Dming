@@ -93,6 +93,30 @@ Generate new token，勾上 `repo`，把它当密码粘贴。
 
 ## 常见问题
 
+**装的时候提示「该软件暂不支持在您的电脑上打开，请联系软件分发者」？**
+
+这句话是 **Windows 自己**弹的（不是 Inno 的），说明 setup 在进入向导之前就被系统拒绝了，
+所以你连具体原因都看不到。原因是我最初写死了 `ArchitecturesAllowed=x64compatible`，
+它要求 64 位 Windows。现在**已经去掉了架构限制**：这个程序是纯 Go 静态二进制、
+装在 `%LocalAppData%` 用户目录，不碰 Program Files 的 32/64 位重定向，
+限制架构没有任何好处，只会把 32 位 Win10 和部分 ARM 设备挡在门外。
+
+重新跑一次 workflow，下载最新的 Artifacts 即可。
+
+另外还有两个可能：
+
+- **Win10 太老**：Inno Setup 的现代安装包需要 Windows 10 1607（2016 年 8 月）或更新。
+- **ARM64 设备**：老的骁龙本可能不支持 x64 模拟。
+
+**这两种情况直接用免安装绿色版**：Artifacts 里的 `dming-portable\` 文件夹，
+解压 → 把 `p.txt` 换成你的名单 → 双击 `dming.exe`，不需要任何安装。
+
+需要明确区分 32/64 位安装包时，命令行覆盖即可：
+
+```bat
+ISCC.exe /DARCH=x64compatible installer\dming.iss
+```
+
 **Actions 页面没有 build 这个条目？**
 确认 `.github/workflows/build.yml` 真的推上去了（GitHub 只认仓库根目录下的
 `.github/workflows/`）。文件路径大小写敏感。

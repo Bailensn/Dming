@@ -46,6 +46,17 @@ jobs:
         continue-on-error: true
         run: dist\dming-windows-amd64.exe -h
 
+      - name: 组一个免安装绿色版
+        shell: cmd
+        run: |
+          mkdir dist\dming-portable
+          copy dist\dming-windows-amd64.exe dist\dming-portable\dming.exe
+          copy class.txt dist\dming-portable\
+          copy p.sample.txt dist\dming-portable\p.txt
+          copy assets\dming.ico dist\dming-portable\
+          echo 免安装版：把 p.txt 换成你的名单，双击 dming.exe 即可。> dist\dming-portable\使用说明.txt
+          echo 班级名称写在 class.txt 里。>> dist\dming-portable\使用说明.txt
+
       - name: 安装 Inno Setup 6
         shell: cmd
         run: choco install innosetup --no-progress -y
@@ -65,6 +76,7 @@ jobs:
           path: |
             dist/dming-windows-amd64.exe
             dist/dming-*-setup.exe
+            dist/dming-portable/
 
   # ---------------------------------------------------------------------------
   # 顺带交叉编译其他平台，跟 Windows 产物一起在 Actions 页面下载。

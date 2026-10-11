@@ -43,13 +43,20 @@ UninstallDisplayIcon={app}\{#AppIconName}
 Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern
-; Inno Setup 6.3 起 x64 更名为 x64compatible，这里两种版本都兼容。
-#if VER >= EncodeVer(6,3,0,0)
-ArchitecturesAllowed=x64compatible
-ArchitecturesInstallIn64BitMode=x64compatible
-#else
-ArchitecturesAllowed=x64
-ArchitecturesInstallIn64BitMode=x64
+; 刻意「不」写 ArchitecturesAllowed。
+;
+; 原因：这个程序是纯 Go 静态二进制，装在 %LocalAppData% 用户目录，
+; 不碰 Program Files 的 32/64 位重定向，所以限制架构没有任何好处，
+; 只会把 32 位 Win10 和部分 ARM 设备挡在门外 —— 表现就是
+; 「该软件暂不支持在您的电脑上打开」，而且那句话是 Windows 自己弹的，
+; 根本进不到 Inno 的向导界面，用户完全看不到原因。
+;
+; 同理不写 ArchitecturesInstallIn64BitMode：不装 Program Files 就不需要它。
+; 如果需要区分 32/64 位安装包，用命令行覆盖即可：
+;   ISCC.exe /DARCH=x64compatible installer\dming.iss
+#ifdef ARCH
+ArchitecturesAllowed={#ARCH}
+ArchitecturesInstallIn64BitMode={#ARCH}
 #endif
 
 [Languages]
