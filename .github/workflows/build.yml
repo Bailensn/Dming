@@ -16,12 +16,15 @@ permissions:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # 在云端 Windows 上编译 exe，并用 Inno Setup 打包成安装程序。
+  # 在云端 Windows 上编译 exe（内嵌图标），再组一个绿色版。
   # 云端 runner 是完整 Windows，cmd.exe 和 PATH 都正常，
   # 完全不受本机环境（PATH 损坏 / 没有 cmd）的影响。
+  #
+  # 不做安装包：纯 Go 静态二进制，绿色版双击就能用，
+  # 而且 Inno 安装包会把 32 位系统 / 老版本 Win10 挡在门外。
   # ---------------------------------------------------------------------------
   windows:
-    name: Windows exe + 安装包
+    name: Windows exe
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -35,16 +38,50 @@ jobs:
           check-latest: true
           cache: false
 
+      # ---------------------------------------------------------------------
+      # 把图标嵌进 exe。
+      #
+      # Go 链接器本身不会读 .ico，但 go build 会自动编译并链接当前目录下
+      # 形如 rsrc_windows_amd64.syso 的资源目标文件 —— 这是 Go 官方的机制，
+      # 所以只要先用 rsrc 把 .ico 转成 .syso 就行，源码一行都不用改。
+      # ---------------------------------------------------------------------
+      - name: 生成图标资源（rsrc_windows_amd64.syso）
+        shell: cmd
+        run: |
+          go install github.com/akavel/rsrc@latest
+          rsrc -ico assets\dming.ico -o rsrc_windows_amd64.syso -arch amd64
+          rsrc -ico assets\dming.ico -o rsrc_windows_arm64.syso -arch arm64
+          dir *.syso
+
       - name: 编译 windows/amd64
         shell: cmd
         run: |
           if not exist dist mkdir dist
           go build -trimpath -ldflags "-s -w" -o dist/dming-windows-amd64.exe .
 
-      - name: 冒烟测试（跑一下 --help，确认不是坏二进制）
+      # 后缀 _windows_arm64 的 syso 只会在 GOOS=windows GOARCH=arm64 时被链接，
+      # 所以两次编译各自吃到正确的图标，互不干扰。
+      - name: 编译 windows/arm64
         shell: cmd
-        continue-on-error: true
-        run: dist\dming-windows-amd64.exe -h
+        env:
+          GOOS: windows
+          GOARCH: arm64
+          CGO_ENABLED: '0'
+        run: |
+          if not exist dist mkdir dist
+          go build -trimpath -ldflags "-s -w" -o dist/dming-windows-arm64.exe .
+
+      - name: 确认图标真的嵌进去了
+        shell: powershell
+        run: |
+          Add-Type -AssemblyName System.Drawing
+          $ico = [System.Drawing.Icon]::ExtractAssociatedIcon((Resolve-Path dist\dming-windows-amd64.exe))
+          if ($null -eq $ico) { throw "exe 里没有图标资源" }
+          Write-Host "图标尺寸: $($ico.Width)x$($ico.Height)"
+          # 顺便确认产物能跑起来（-h 会打印用法并返回 2，不算失败）
+          $out = & .\dist\dming-windows-amd64.exe -h 2>&1 | Out-String
+          Write-Host "--- exe -h 输出 ---"
+          Write-Host $out
 
       - name: 组一个免安装绿色版
         shell: cmd
@@ -53,17 +90,17 @@ jobs:
           copy dist\dming-windows-amd64.exe dist\dming-portable\dming.exe
           copy class.txt dist\dming-portable\
           copy p.sample.txt dist\dming-portable\p.txt
-          copy assets\dming.ico dist\dming-portable\
-          echo 免安装版：把 p.txt 换成你的名单，双击 dming.exe 即可。> dist\dming-portable\使用说明.txt
-          echo 班级名称写在 class.txt 里。>> dist\dming-portable\使用说明.txt
-
-      - name: 安装 Inno Setup 6
-        shell: cmd
-        run: choco install innosetup --no-progress -y
-
-      - name: 打包安装程序
-        shell: cmd
-        run: '"C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\dming.iss'
+          echo 免安装版，解压即用。> dist\dming-portable\使用说明.txt
+          echo.>> dist\dming-portable\使用说明.txt
+          echo 1. 把 p.txt 换成你的名单（每行一个姓名）。>> dist\dming-portable\使用说明.txt
+          echo 2. 班级名称写在 class.txt 里。>> dist\dming-portable\使用说明.txt
+          echo 3. 双击 dming.exe 即可点名，页面会用默认浏览器打开。>> dist\dming-portable\使用说明.txt
+          echo.>> dist\dming-portable\使用说明.txt
+          echo 命令行参数：>> dist\dming-portable\使用说明.txt
+          echo   dming.exe -keep       保留生成的 HTML，不自动删除>> dist\dming-portable\使用说明.txt
+          echo   dming.exe -no-open    只生成 HTML，不打开浏览器>> dist\dming-portable\使用说明.txt
+          echo.>> dist\dming-portable\使用说明.txt
+          echo 注意 p.txt 和 class.txt 必须和 dming.exe 放在同一个文件夹。>> dist\dming-portable\使用说明.txt
 
       - name: 列出产物
         shell: cmd
@@ -75,7 +112,7 @@ jobs:
           if-no-files-found: error
           path: |
             dist/dming-windows-amd64.exe
-            dist/dming-*-setup.exe
+            dist/dming-windows-arm64.exe
             dist/dming-portable/
 
   # ---------------------------------------------------------------------------

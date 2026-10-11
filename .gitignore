@@ -17,3 +17,6 @@ Thumbs.db
 
 # 本机临时文件
 DMING*.html
+
+# rsrc 生成的图标资源（构建时现生成）
+*.syso
