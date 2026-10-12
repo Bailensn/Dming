@@ -17,9 +17,20 @@ cd /d "%~dp0"
 set OUT=dist
 if not exist "%OUT%" mkdir "%OUT%"
 
+rem The version string lives in TWO places: APP_VERSION in src\dming.c and
+rem FILEVERSION / FileVersion in src\dming.rc. Change one, change the other,
+rem or the exe properties will show a stale version.
 echo === Regenerating src\page.h ===
-python src\mkpage.py
-if errorlevel 1 goto :nopython
+set PY=
+where python >nul 2>&1
+if not errorlevel 1 set PY=python
+if not defined PY (
+	where py >nul 2>&1
+	if not errorlevel 1 set PY=py
+)
+if not defined PY goto :nopython
+%PY% src\mkpage.py
+if errorlevel 1 goto :fail
 
 set CC=
 where gcc >nul 2>&1
@@ -30,9 +41,16 @@ if not defined CC (
 )
 if not defined CC goto :nocc
 
+rem Deliberately NO -s here. Stripping saves only ~3 KB, but it pushes the PE
+rem closer to the "no symbols + tiny import table + no resources" profile that
+rem packed malware has. Better to look like an ordinary mingw build.
+rem --dynamicbase / --nxcompat ask for ASLR + DEP explicitly; modern legitimate
+rem binaries always have them.
+set WFLAGS=-std=gnu99 -O2 -Wall -Wextra -Wl,--dynamicbase -Wl,--nxcompat
+
 echo.
 echo === Compiling with %CC% ===
-%CC% -std=gnu99 -O2 -Wall -Wextra -o "%OUT%\dming.exe" src\dming.c
+%CC% %WFLAGS% -o "%OUT%\dming.exe" src\dming.c
 if errorlevel 1 goto :fail
 
 rem Icon + version info. Optional - a resource-less exe looks more suspicious
@@ -48,7 +66,7 @@ if defined RC (
 	%RC% dming.rc -O coff -o dming_res.o
 	popd
 	if exist src\dming_res.o (
-		%CC% -std=gnu99 -O2 -s -o "%OUT%\dming.exe" src\dming.c src\dming_res.o -luser32
+		%CC% %WFLAGS% -o "%OUT%\dming.exe" src\dming.c src\dming_res.o -lshell32 -luser32
 		if errorlevel 1 goto :fail
 	) else (
 		echo Warning: windres failed - continuing without icon/version info.

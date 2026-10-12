@@ -565,7 +565,14 @@ static void add_first_cb(void *ud, const char *s, size_t len)
  * 转义
  * ========================================================================== */
 
-/* 注入 JS 数组用：转义 " \ 和控制字符，UTF-8 原样透传 */
+/*
+ * 注入 JS 数组用：转义 " \ 和 < > &，UTF-8 原样透传。
+ *
+ * < > & 并不是 JSON 语法要求的，但这段 JSON 是嵌在 HTML 的 <script> 里的：
+ * 姓名要是含 "</script>"（或者 "<script>"），就会冲出脚本块变成 HTML，
+ * 轻则页面崩掉，重则被当成注入。转成 \u003c 之后 JS 解析出来还是原字符，
+ * 显示完全一样，但不可能再冲出标签。这是「JSON 嵌 HTML」的标准做法。
+ */
 static void json_escape(Buf *out, const char *s)
 {
     const unsigned char *p = (const unsigned char *)s;
@@ -576,6 +583,9 @@ static void json_escape(Buf *out, const char *s)
         case '\n': buf_puts(out, "\\n");  break;
         case '\r': buf_puts(out, "\\r");  break;
         case '\t': buf_puts(out, "\\t");  break;
+        case '<':  buf_puts(out, "\\u003c"); break;
+        case '>':  buf_puts(out, "\\u003e"); break;
+        case '&':  buf_puts(out, "\\u0026"); break;
         default:
             if (*p < 0x20) {
                 char tmp[8];
@@ -637,13 +647,21 @@ static int try_exec(char *const argv[])
 {
     pid_t pid = fork();
     int status = 0;
+    pid_t w;
+
     if (pid < 0)
         return -1;
     if (pid == 0) {
         execvp(argv[0], argv);
         _exit(127);          /* 127 = 找不到命令 */
     }
-    if (waitpid(pid, &status, 0) < 0)
+
+    /* waitpid 可能被信号打断（EINTR），那不是失败，要接着等 */
+    do {
+        w = waitpid(pid, &status, 0);
+    } while (w < 0 && errno == EINTR);
+
+    if (w < 0)
         return -1;
     if (WIFEXITED(status) && WEXITSTATUS(status) == 127)
         return -1;
@@ -731,19 +749,34 @@ static void usage(FILE *out, const char *argv0)
         APP_NAME, APP_VERSION, APP_DESC, argv0);
 }
 
-/* "8s" / "800ms" / "8"（裸数字按秒） */
+/*
+ * "8s" / "800ms" / "8"（裸数字按秒）。
+ *
+ * 上限 24 小时：strtol 溢出时会返回 LONG_MAX，后面再乘 1000 就是有符号溢出
+ * （未定义行为）。所以必须在乘法【之前】卡住，不能先算再判断。
+ */
 static int parse_delay(const char *s, int *out_ms)
 {
     char *end = NULL;
     long v = strtol(s, &end, 10);
+    long ms;
+
     if (end == s || v < 0)
         return -1;
-    if (*end == '\0' || strcmp(end, "s") == 0)
-        *out_ms = (int)(v * 1000);
-    else if (strcmp(end, "ms") == 0)
-        *out_ms = (int)v;
-    else
+
+    if (*end == '\0' || strcmp(end, "s") == 0) {
+        if (v > 86400L)
+            return -1;
+        ms = v * 1000L;
+    } else if (strcmp(end, "ms") == 0) {
+        if (v > 86400000L)
+            return -1;
+        ms = v;
+    } else {
         return -1;
+    }
+
+    *out_ms = (int)ms;
     return 0;
 }
 

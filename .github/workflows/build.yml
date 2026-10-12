@@ -60,12 +60,20 @@ jobs:
         run: |
           set -eux
           mkdir -p dist
+
+          # Windows 上刻意【不加 -s】。剥离符号表只省 3 KB 左右，但会让 PE
+          # 更接近「无符号 + 导入表极小 + 无资源」的加壳特征。宁可留着符号，
+          # 让它看起来就是普通 mingw 编译产物。
+          # --dynamicbase / --nxcompat 显式要求 ASLR + DEP，现代正规程序都有，
+          # 缺了反而可疑（老式木马就没有）。
+          WFLAGS="$CFLAGS -Wl,--dynamicbase -Wl,--nxcompat"
+
           build() {
             arch="$1"; cc="$2"; rc="$3"
             echo "=== windows/$arch ==="
             ( cd src && "$rc" dming.rc -O coff -o dming_res.o )
-            "$cc" $CFLAGS -s -o "dist/dming-windows-$arch.exe" \
-              src/dming.c src/dming_res.o -luser32
+            "$cc" $WFLAGS -o "dist/dming-windows-$arch.exe" \
+              src/dming.c src/dming_res.o -lshell32 -luser32
           }
           build 386   i686-w64-mingw32-gcc   i686-w64-mingw32-windres
           build amd64 x86_64-w64-mingw32-gcc x86_64-w64-mingw32-windres
@@ -74,6 +82,7 @@ jobs:
         run: |
           set -eux
           CC_A=aarch64-w64-mingw32-clang
+          WFLAGS="$CFLAGS -Wl,--dynamicbase -Wl,--nxcompat"
           command -v "$CC_A" >/dev/null || { echo "找不到 $CC_A"; exit 1; }
 
           # llvm-mingw 通常提供 <triple>-windres；没有就退回 llvm-windres
@@ -95,7 +104,26 @@ jobs:
           fi
 
           echo "=== windows/arm64 ==="
-          "$CC_A" $CFLAGS -s -o dist/dming-windows-arm64.exe src/dming.c $RES -luser32
+          "$CC_A" $WFLAGS -o dist/dming-windows-arm64.exe src/dming.c $RES -lshell32 -luser32
+
+      - name: 校验版本号两处一致
+        run: |
+          set -eux
+          # 版本号写在两个地方：dming.c 的 APP_VERSION 和 dming.rc 的
+          # FILEVERSION / FileVersion。改一处忘另一处的话，exe 属性里会显示
+          # 错版本，所以这里直接拦下来。
+          V="$(sed -n 's/^#define APP_VERSION "\([0-9.]*\)".*/\1/p' src/dming.c)"
+          test -n "$V" || { echo "::error::没能从 dming.c 里读出 APP_VERSION"; exit 1; }
+          echo "dming.c APP_VERSION = $V"
+
+          DOTTED="$(printf '%s' "$V" | tr . ,)"
+          grep -qE "^FILEVERSION[[:space:]]+$DOTTED,0" src/dming.rc \
+            || { echo "::error::dming.rc 的 FILEVERSION 和 $V 对不上"; exit 1; }
+          grep -qE "^PRODUCTVERSION[[:space:]]+$DOTTED,0" src/dming.rc \
+            || { echo "::error::dming.rc 的 PRODUCTVERSION 和 $V 对不上"; exit 1; }
+          grep -q "\"$V.0\"" src/dming.rc \
+            || { echo "::error::dming.rc 的字符串版本号和 $V 对不上"; exit 1; }
+          echo "OK: 两处版本一致"
 
       - name: 校验 exe 里真的有图标资源
         run: |
