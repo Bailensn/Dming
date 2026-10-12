@@ -20,7 +20,7 @@ permissions:
   contents: read
 
 env:
-  CFLAGS: -std=c99 -O2 -Wall -Wextra
+  CFLAGS: -std=gnu99 -O2 -Wall -Wextra
 
 jobs:
   # ===========================================================================

@@ -20,7 +20,7 @@ RC="${RC:-}"
 TARGET="${1:-$(uname -s | tr 'A-Z' 'a-z')-$(uname -m)}"
 BIN="$OUT/dming-$TARGET$EXT"
 
-CFLAGS="${CFLAGS:--std=c99 -O2 -Wall -Wextra}"
+CFLAGS="${CFLAGS:--std=gnu99 -O2 -Wall -Wextra}"
 
 mkdir -p "$OUT"
 

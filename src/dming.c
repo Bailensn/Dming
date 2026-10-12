@@ -21,6 +21,28 @@
  *   windres dming.rc -O coff -o dming_res.o && cc -O2 -o dming.exe dming.c dming_res.o -luser32
  */
 
+/*
+ * 特性宏必须在任何 #include 之前定义。
+ *
+ * 用 -std=c99（而不是 gnu99）时会定义 __STRICT_ANSI__，于是：
+ *   glibc -> 不再自动定义 _DEFAULT_SOURCE，_POSIX_C_SOURCE 也设不上，
+ *            __USE_POSIX 被关掉，readlink / fork / execvp / waitpid /
+ *            nanosleep / realpath 全部失去声明。
+ *   macOS -> __DARWIN_C_LEVEL 退化成 __DARWIN_C_ANSI，POSIX 声明一样被藏。
+ * 在 GCC 14 / Clang 下隐式声明是硬错误，直接编译失败。
+ *
+ * bionic（Android）不做这套隐藏，所以只有 Android 能编过 —— 这个差异很坑。
+ * 这里显式打开，配合构建脚本里的 -std=gnu99 双保险。
+ */
+#if !defined(_WIN32)
+#  ifndef _DEFAULT_SOURCE
+#    define _DEFAULT_SOURCE 1      /* glibc: 打开 POSIX + BSD 声明 */
+#  endif
+#  ifndef _DARWIN_C_SOURCE
+#    define _DARWIN_C_SOURCE 1     /* macOS: 打开全部声明（其他平台无副作用） */
+#  endif
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -48,10 +70,13 @@
 #ifdef _WIN32
 #  define WIN32_LEAN_AND_MEAN
 #  include <windows.h>
+#  include <shellapi.h>   /* ShellExecuteW —— 不在 windows.h 里，漏了会编译失败 */
+#  include <wchar.h>      /* wcslen / wcsrchr */
 typedef wchar_t pchar;
 #  define PLIT_(s) L##s
 #  define PATH_SEP L'\\'
 #else
+#  include <sys/types.h>  /* pid_t / ssize_t，别指望 unistd.h 一定会带进来 */
 #  include <unistd.h>
 #  include <sys/stat.h>
 #  include <sys/wait.h>
@@ -248,8 +273,13 @@ static pchar *exe_dir(const char *argv0)
 {
 #ifdef _WIN32
     wchar_t buf[32768];
-    DWORD n = GetModuleFileNameW(NULL, buf, (DWORD)(sizeof buf / sizeof buf[0]));
+    DWORD n;
     wchar_t *s;
+
+    /* GetModuleFileNameW 在 Windows 上足够可靠，不用 argv[0] 兜底 */
+    (void)argv0;
+
+    n = GetModuleFileNameW(NULL, buf, (DWORD)(sizeof buf / sizeof buf[0]));
     if (n == 0 || n >= (DWORD)(sizeof buf / sizeof buf[0]))
         return NULL;
     s = wcsrchr(buf, L'\\');

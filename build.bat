@@ -32,7 +32,7 @@ if not defined CC goto :nocc
 
 echo.
 echo === Compiling with %CC% ===
-%CC% -std=c99 -O2 -Wall -Wextra -o "%OUT%\dming.exe" src\dming.c
+%CC% -std=gnu99 -O2 -Wall -Wextra -o "%OUT%\dming.exe" src\dming.c
 if errorlevel 1 goto :fail
 
 rem Icon + version info. Optional - a resource-less exe looks more suspicious
@@ -48,7 +48,7 @@ if defined RC (
 	%RC% dming.rc -O coff -o dming_res.o
 	popd
 	if exist src\dming_res.o (
-		%CC% -std=c99 -O2 -s -o "%OUT%\dming.exe" src\dming.c src\dming_res.o -luser32
+		%CC% -std=gnu99 -O2 -s -o "%OUT%\dming.exe" src\dming.c src\dming_res.o -luser32
 		if errorlevel 1 goto :fail
 	) else (
 		echo Warning: windres failed - continuing without icon/version info.

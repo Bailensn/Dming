@@ -92,7 +92,7 @@ HTML 属性统一用单引号，JS 字符串也用单引号。这样每行只要
 cd src
 windres dming.rc -O coff -o dming_res.o
 cd ..
-gcc -std=c99 -O2 -s -o dist\dming.exe src\dming.c src\dming_res.o -luser32
+gcc -std=gnu99 -O2 -s -o dist\dming.exe src\dming.c src\dming_res.o -luser32
 ```
 
 `build.bat` 会自动做这一步；找不到 `windres` 就跳过并给警告（不致命）。
