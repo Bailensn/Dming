@@ -1,0 +1,47 @@
+/*
+ * dming 的 Windows 资源：图标 + 版本信息
+ *
+ * 纯 ASCII，不含中文 —— 资源编译器对非 ASCII 的处理依赖代码页参数，
+ * 为了不给构建引入失败点，这里统一用英文。程序界面本身还是中文。
+ * （想改成中文元数据，加 --codepage=65001 并改成 "080404B0" 块即可。）
+ *
+ * 编译（在 src/ 目录下执行，这样 ../assets 能解析对）：
+ *   windres dming.rc -O coff -o dming_res.o
+ * 然后链接时带上：
+ *   gcc -O2 -s -o dming.exe dming.c dming_res.o -luser32
+ */
+
+#include <windows.h>
+
+/* 应用程序图标。用最小的资源 ID，Windows 会优先拿它当 exe 图标。 */
+1 ICON "../assets/dming.ico"
+
+1 VERSIONINFO
+FILEVERSION     3,4,3,0
+PRODUCTVERSION  3,4,3,0
+FILEFLAGSMASK   0x3fL
+FILEFLAGS       0x0L
+FILEOS          VOS_NT_WINDOWS32
+FILETYPE        VFT_APP
+FILESUBTYPE     VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        /* 0409 = en-US, 04B0 = Unicode */
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName",      "Bailensn"
+            VALUE "FileDescription",  "dming - classroom random name picker"
+            VALUE "FileVersion",      "3.4.3.0"
+            VALUE "InternalName",     "dming"
+            VALUE "LegalCopyright",   "Apache License 2.0"
+            VALUE "OriginalFilename", "dming.exe"
+            VALUE "ProductName",      "dming"
+            VALUE "ProductVersion",   "3.4.3.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

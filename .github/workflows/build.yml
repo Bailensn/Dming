@@ -11,201 +11,111 @@ name: build
 on:
   push:
     branches: [main, master]
-    # 手动推 tag 也支持（比如想重发某个版本），tag 名仍是短 SHA。
     tags: ['[0-9a-f]*']
   pull_request:
   workflow_dispatch:
 
-# 默认只读；发 Release 需要写权限，在 release job 里单独提权，
-# 避免把这个权限给到跑第三方 action 的构建 job。
+# 默认只读；发 Release 需要写权限，在 release job 里单独提权。
 permissions:
   contents: read
 
+env:
+  CFLAGS: -std=c99 -O2 -Wall -Wextra
+
 jobs:
-  # ---------------------------------------------------------------------------
-  # 在云端 Windows 上编译 exe（内嵌图标），再组一个绿色版。
-  # 云端 runner 是完整 Windows，cmd.exe 和 PATH 都正常，
-  # 完全不受本机环境（PATH 损坏 / 没有 cmd）的影响。
+  # ===========================================================================
+  # Windows：在 ubuntu 上用 mingw 交叉编译。
   #
-  # 不做安装包：纯 Go 静态二进制，绿色版双击就能用，
-  # 而且 Inno 安装包会把 32 位系统 / 老版本 Win10 挡在门外。
-  # ---------------------------------------------------------------------------
+  # 放 ubuntu 而不是 windows runner，有两个好处：
+  #   1. runner 更快
+  #   2. 打包（绿色版目录 + 含中文文件名的 zip）走 bash + zip，
+  #      完全没有 PowerShell 那套编码坑
+  #
+  # Debian/Ubuntu 的 mingw-w64 只提供 i686 和 x86_64，
+  # aarch64 得用 llvm-mingw。
+  # ===========================================================================
   windows:
-    name: Windows exe
-    runs-on: windows-latest
+    name: Windows
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-go@v5
-        with:
-          # 用 go.mod 里的 go 指令当最低版本要求（现在是 1.21），
-          # check-latest 让它装最新的 1.2x 稳定版。
-          # 不要写死具体补丁号 —— 云端缓存里未必有那个版本，会直接报错。
-          go-version-file: go.mod
-          check-latest: true
-          cache: false
-
-      # ---------------------------------------------------------------------
-      # 把图标嵌进 exe。
-      #
-      # Go 链接器本身不会读 .ico，但 go build 会自动编译并链接当前目录下
-      # 形如 rsrc_windows_amd64.syso 的资源目标文件 —— 这是 Go 官方的机制，
-      # 所以只要先用 rsrc 把 .ico 转成 .syso 就行，源码一行都不用改。
-      # ---------------------------------------------------------------------
-      - name: 生成图标资源（rsrc_windows_*.syso）
-        shell: cmd
+      - name: 装工具链（mingw-w64 + llvm-mingw）
         run: |
-          go install github.com/akavel/rsrc@latest
-          rsrc -ico assets\dming.ico -o rsrc_windows_386.syso   -arch 386
-          rsrc -ico assets\dming.ico -o rsrc_windows_amd64.syso -arch amd64
-          rsrc -ico assets\dming.ico -o rsrc_windows_arm64.syso -arch arm64
-          dir *.syso
+          set -eux
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gcc-mingw-w64-i686 gcc-mingw-w64-x86-64
 
-      # 每个架构一个 .syso，后缀必须和目标平台对上，否则会被 Go 静默忽略。
-      # 反过来说三个文件放一起也不会互相干扰，各自只在自己那次编译里生效。
-      # 注意 Go 没有 windows/arm（32 位 ARM Windows）这个 port，
-      # Windows 上只有 386 / amd64 / arm64 三种。
-      - name: 编译 windows/386
-        shell: cmd
-        env:
-          GOOS: windows
-          GOARCH: '386'
-          CGO_ENABLED: '0'
-        run: |
-          if not exist dist mkdir dist
-          go build -trimpath -ldflags "-s -w" -o dist/dming-windows-386.exe .
+          # aarch64 用 llvm-mingw，版本写死以保证构建可复现
+          LM=llvm-mingw-20261006-ucrt-ubuntu-22.04-x86_64
+          curl -fsSL -o /tmp/llvm-mingw.tar.xz \
+            "https://github.com/mstorsjo/llvm-mingw/releases/download/20261006/${LM}.tar.xz"
+          sudo tar -xJf /tmp/llvm-mingw.tar.xz -C /opt
+          echo "/opt/${LM}/bin" >> "$GITHUB_PATH"
 
-      - name: 编译 windows/amd64
-        shell: cmd
+      - name: 生成 page.h
+        run: python3 src/mkpage.py
+
+      - name: 编译 windows/386 与 windows/amd64
         run: |
-          if not exist dist mkdir dist
-          go build -trimpath -ldflags "-s -w" -o dist/dming-windows-amd64.exe .
+          set -eux
+          mkdir -p dist
+          build() {
+            arch="$1"; cc="$2"; rc="$3"
+            echo "=== windows/$arch ==="
+            ( cd src && "$rc" dming.rc -O coff -o dming_res.o )
+            "$cc" $CFLAGS -s -o "dist/dming-windows-$arch.exe" \
+              src/dming.c src/dming_res.o -luser32
+          }
+          build 386   i686-w64-mingw32-gcc   i686-w64-mingw32-windres
+          build amd64 x86_64-w64-mingw32-gcc x86_64-w64-mingw32-windres
 
       - name: 编译 windows/arm64
-        shell: cmd
-        env:
-          GOOS: windows
-          GOARCH: arm64
-          CGO_ENABLED: '0'
         run: |
-          if not exist dist mkdir dist
-          go build -trimpath -ldflags "-s -w" -o dist/dming-windows-arm64.exe .
+          set -eux
+          CC_A=aarch64-w64-mingw32-clang
+          command -v "$CC_A" >/dev/null || { echo "找不到 $CC_A"; exit 1; }
 
-      # 注意：Windows 上这两步的脚本必须是纯 ASCII。
-      # GitHub Actions 把 run 块写成 UTF-8 文件，而 Windows PowerShell 5.1
-      # 读无 BOM 的 .ps1 时按系统 ANSI 代码页解码，中文会变成
-      # 「exe é‡Œæ²¡æœ‰...」这种乱码并直接语法报错。cmd.exe 同理（用 OEM 代码页）。
-      # 要用中文就得走 pwsh（PowerShell 7，默认按 UTF-8 读脚本）。
-      - name: 确认图标真的嵌进去了
-        shell: powershell
+          # llvm-mingw 通常提供 <triple>-windres；没有就退回 llvm-windres
+          if command -v aarch64-w64-mingw32-windres >/dev/null 2>&1; then
+            RC_A=aarch64-w64-mingw32-windres
+          elif command -v llvm-windres >/dev/null 2>&1; then
+            RC_A="llvm-windres --target=aarch64-w64-mingw32"
+          else
+            RC_A=""
+          fi
+
+          RES=""
+          if [ -n "$RC_A" ]; then
+            echo "=== 资源编译器: $RC_A ==="
+            ( cd src && $RC_A dming.rc -O coff -o dming_res.o )
+            RES=src/dming_res.o
+          else
+            echo "::warning::没有 aarch64 的 windres，windows/arm64 将不含图标和版本信息"
+          fi
+
+          echo "=== windows/arm64 ==="
+          "$CC_A" $CFLAGS -s -o dist/dming-windows-arm64.exe src/dming.c $RES -luser32
+
+      - name: 校验三个 exe 里都真的有图标资源
         run: |
-          # NOTE: this script is ASCII-only on purpose, see the comment above.
-          #
-          # Do NOT use ExtractAssociatedIcon to test for an icon: when a file has
-          # no icon resource, Windows hands back the generic application icon
-          # rather than $null, so such a test would always pass.
-          # Parse the PE section table instead and require a .rsrc section --
-          # the Go linker only emits that section when a rsrc_*.syso is linked.
-          #
-          # Check every architecture: forgetting to generate one of the .syso
-          # files is silent (Go just ignores the missing resource), and that is
-          # exactly the mistake that is easiest to make here.
-          $sectionNames = {
-            param($path)
-            $fs = [IO.File]::OpenRead($path)
-            $br = New-Object IO.BinaryReader($fs)
-            try {
-              $fs.Position = 0x3C
-              $peOff = $br.ReadInt32()
-              $fs.Position = $peOff + 6
-              $numSections = $br.ReadUInt16()
-              $fs.Position = $peOff + 20
-              $optSize = $br.ReadUInt16()
-              $sectOff = $peOff + 24 + $optSize
-              $out = @()
-              for ($i = 0; $i -lt $numSections; $i++) {
-                $fs.Position = $sectOff + $i * 40
-                $out += ([Text.Encoding]::ASCII.GetString($br.ReadBytes(8))).TrimEnd([char]0)
-              }
-              return $out
-            } finally {
-              $fs.Close()
-            }
-          }
+          python3 tools/check-pe.py \
+            dist/dming-windows-386.exe \
+            dist/dming-windows-amd64.exe \
+            dist/dming-windows-arm64.exe
 
-          Add-Type -AssemblyName System.Drawing
-          $failed = @()
-          foreach ($arch in @('386', 'amd64', 'arm64')) {
-            $exe = (Resolve-Path "dist\dming-windows-$arch.exe").Path
-            $names = & $sectionNames $exe
-            Write-Host "[$arch] sections: $($names -join ', ')"
-            if ($names -notcontains '.rsrc') {
-              Write-Host "  --> MISSING .rsrc, icon was not linked in"
-              $failed += $arch
-              continue
-            }
-            $ico = [System.Drawing.Icon]::ExtractAssociatedIcon($exe)
-            Write-Host "  OK: .rsrc present, extracted icon $($ico.Width)x$($ico.Height)"
-          }
-          if ($failed.Count -gt 0) {
-            throw "icon missing in: $($failed -join ', ')"
-          }
-          Write-Host "OK: all three Windows binaries have the icon embedded"
-
-      # 真的把程序跑一遍，确认它能读名单、能生成页面。
-      # 注意：这一步必须用 stdout，不能碰 stderr —— runner 对 powershell 步骤
-      # 预设了 $ErrorActionPreference = 'Stop'，原生命令只要往 stderr 写一个字，
-      # 就会被包成 NativeCommandError 直接让步骤失败。
-      # （`dming.exe -h` 的用法说明走的就是 stderr，之前就是这么挂的。）
-      - name: 冒烟测试：跑一遍看能不能出页面
-        shell: powershell
+      - name: 组绿色版（中文说明直接写在 bash heredoc 里）
         run: |
-          # NOTE: ASCII-only, see the comment above.
-          $exe = (Resolve-Path dist\dming-windows-amd64.exe).Path
-          $tmp = Join-Path $env:TEMP 'dming-smoke'
-          if (Test-Path $tmp) { Remove-Item $tmp -Recurse -Force }
-          New-Item -ItemType Directory -Force -Path $tmp | Out-Null
-
-          Copy-Item $exe (Join-Path $tmp 'dming.exe')
-          Set-Content -Path (Join-Path $tmp 'p.txt')     -Value "Alice`nBob`nCarol" -Encoding utf8
-          Set-Content -Path (Join-Path $tmp 'class.txt') -Value '14'                -Encoding utf8
-          Write-Host "test data: $(Get-Content (Join-Path $tmp 'p.txt') -Raw)"
-
-          Push-Location $tmp
-          try {
-            & .\dming.exe -no-open | Write-Host
-          } finally {
-            Pop-Location
-          }
-
-          $page = @(Get-ChildItem $tmp -Filter 'DMING*.html')
-          if ($page.Count -ne 1) {
-            throw "expected exactly one DMING*.html page, got $($page.Count)"
-          }
-          Write-Host "OK: generated $($page[0].Name) ($($page[0].Length) bytes)"
-
-          $html = Get-Content $page[0].FullName -Raw
-          foreach ($needle in @('14', 'Alice', 'Bob', 'Carol')) {
-            if ($html -notmatch [regex]::Escape($needle)) {
-              throw "generated page is missing '$needle'"
-            }
-          }
-          Write-Host "OK: page contains the class number and all three names"
-
-      - name: 组一个免安装绿色版
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path dist/dming-portable | Out-Null
-          # 默认的 dming.exe 用 amd64（绝大多数机器）。
-          Copy-Item dist/dming-windows-amd64.exe dist/dming-portable/dming.exe
-          # 32 位机器用这个；arm64 设备用最后一个。
-          Copy-Item dist/dming-windows-386.exe   dist/dming-portable/dming-386.exe
-          Copy-Item dist/dming-windows-arm64.exe dist/dming-portable/dming-arm64.exe
-          Copy-Item class.txt   dist/dming-portable/
-          Copy-Item p.sample.txt dist/dming-portable/p.txt
-          Copy-Item assets/dming.ico dist/dming-portable/
-
-          $readme = @'
+          set -eux
+          P=dist/dming-portable
+          mkdir -p "$P"
+          cp dist/dming-windows-amd64.exe "$P/dming.exe"
+          cp dist/dming-windows-386.exe   "$P/dming-386.exe"
+          cp dist/dming-windows-arm64.exe "$P/dming-arm64.exe"
+          cp class.txt "$P/"
+          cp p.sample.txt "$P/p.txt"
+          cp assets/dming.ico "$P/"
+          cat > "$P/使用说明.txt" <<'EOF'
           免安装版，解压即用。
 
           1. 把 p.txt 换成你的名单（每行一个姓名）。
@@ -226,46 +136,16 @@ jobs:
             dming.exe -delay 8s    延长清理前的等待时间
 
           注意 p.txt 和 class.txt 必须和 exe 放在同一个文件夹里。
-          '@
-          # pwsh 的 utf8 是无 BOM 的 UTF-8，记事本可以正常识别。
-          Set-Content -Path 'dist/dming-portable/使用说明.txt' -Value $readme -Encoding utf8
-          Get-ChildItem dist/dming-portable | Format-Table Name, Length
+          EOF
 
-      - name: 列出产物
-        shell: cmd
-        run: dir /b dist
-
-      # 打成两个 zip，给 Release 用（Actions 的 Artifacts 会再包一层 zip，
-      # 发布时直接给这两个更清爽）。
-      # 用 pwsh 而不是 powershell：绿色版里有中文文件名，
-      # PowerShell 5.1 在 zip 条目编码上会出问题，pwsh（.NET Core）不会。
-      - name: 打包发布用 zip
-        shell: pwsh
+      - name: 打包 zip
         run: |
-          Compress-Archive -Path dist/dming-portable/* `
-            -DestinationPath dist/dming-windows-portable.zip -Force
-          Compress-Archive -Path dist/dming-windows-386.exe, dist/dming-windows-amd64.exe, `
-                             dist/dming-windows-arm64.exe `
-            -DestinationPath dist/dming-windows-exe.zip -Force
-
-          # 把 zip 里的条目标题读回来核一遍。名字要是坏了就让 job 直接失败，
-          # 而不是把乱码文件名的包发出去。
-          Add-Type -AssemblyName System.IO.Compression.FileSystem
-          $zipPath = (Resolve-Path dist/dming-windows-portable.zip).Path
-          $zip = [IO.Compression.ZipFile]::OpenRead($zipPath)
-          try {
-            $entries = @($zip.Entries | ForEach-Object { $_.FullName })
-          } finally {
-            $zip.Dispose()
-          }
-          Write-Host "portable zip entries:"
-          $entries | ForEach-Object { Write-Host "  $_" }
-          if ($entries -notcontains '使用说明.txt') {
-            throw "zip entry name came back mangled; expected 使用说明.txt"
-          }
-          Write-Host "OK: entry names survived the round trip"
-
-          Get-ChildItem dist/*.zip | Format-Table Name, Length
+          set -eux
+          cd dist
+          zip -r -q dming-windows-portable.zip dming-portable
+          zip -q dming-windows-exe.zip \
+            dming-windows-386.exe dming-windows-amd64.exe dming-windows-arm64.exe
+          unzip -l dming-windows-portable.zip
 
       - uses: actions/upload-artifact@v4
         with:
@@ -278,96 +158,154 @@ jobs:
             dist/dming-portable/
             dist/*.zip
 
-  # ---------------------------------------------------------------------------
-  # 顺带交叉编译其他平台，跟 Windows 产物一起在 Actions 页面下载。
-  # ---------------------------------------------------------------------------
-  cross:
-    name: ${{ matrix.goos }}-${{ matrix.goarch }}
+  # ===========================================================================
+  # Linux 各架构。全部静态链接，免得依赖构建机的 glibc 版本。
+  # ===========================================================================
+  linux:
+    name: ${{ matrix.name }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         include:
-          # 64 位
-          - { goos: linux,   goarch: amd64 }
-          - { goos: linux,   goarch: arm64 }
-          - { goos: darwin,  goarch: amd64 }
-          - { goos: darwin,  goarch: arm64 }
-          - { goos: android, goarch: arm64 }   # Termux
-          # 32 位
-          # windows/386 在 windows job 里单独编（要嵌图标），这里不重复。
-          # 注意 Go 没有 windows/arm（32 位 ARM Windows），darwin 也早就没有 32 位。
-          # 也不要 android/arm —— 32 位 Android 设备现在基本见不到了。
-          - { goos: linux,   goarch: '386' }   # 32 位 x86 Linux
-          - { goos: linux,   goarch: arm }     # 32 位 ARM（树莓派 32 位系统等）
+          - { name: linux-amd64, arch: amd64, cc: gcc,                     apt: "" }
+          - { name: linux-386,   arch: 386,   cc: "gcc -m32",              apt: gcc-multilib }
+          - { name: linux-arm,   arch: arm,   cc: arm-linux-gnueabihf-gcc, apt: gcc-arm-linux-gnueabihf }
+          - { name: linux-arm64, arch: arm64, cc: aarch64-linux-gnu-gcc,   apt: gcc-aarch64-linux-gnu }
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-          check-latest: true
-          cache: false
+      - name: 生成 page.h
+        run: python3 src/mkpage.py
 
-      - name: 编译 ${{ matrix.goos }}/${{ matrix.goarch }}
-        env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
-          CGO_ENABLED: '0'
+      - name: 装交叉编译器
+        if: matrix.apt != ''
         run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ${{ matrix.apt }}
+
+      - name: 编译 ${{ matrix.name }}
+        run: |
+          set -eux
           mkdir -p dist
-          go build -trimpath -ldflags "-s -w" \
-            -o "dist/dming-${{ matrix.goos }}-${{ matrix.goarch }}" .
+          ${{ matrix.cc }} $CFLAGS -static -s -o "dist/dming-${{ matrix.name }}" src/dming.c
+          file "dist/dming-${{ matrix.name }}"
+
+      # 原生架构就真跑一遍，算端到端冒烟测试
+      - name: 冒烟测试（只在 linux-amd64 上跑）
+        if: matrix.arch == 'amd64'
+        run: |
+          set -eux
+          T="$(mktemp -d)"
+          cp dist/dming-linux-amd64 "$T/dming"
+          printf 'Alice\nBob\n\n  Carol  \n张三\r\n' > "$T/p.txt"
+          printf '14\n' > "$T/class.txt"
+
+          # 故意 cd 到别处，验证它读的是 exe 所在目录而不是当前目录
+          ( cd / && "$T/dming" -no-open )
+
+          page="$(ls "$T"/DMING*.html)"
+          echo "生成的页面: $page"
+          grep -q '<title>14班点名</title>' "$page"
+          grep -q 'version 3.4.3' "$page"
+          grep -q 'let originalStudents = \["Alice","Bob","Carol","张三"\]' "$page"
+          echo "OK: 页面内容正确"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: dming-${{ matrix.goos }}-${{ matrix.goarch }}
+          name: dming-${{ matrix.name }}
           if-no-files-found: error
-          path: dist/dming-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/dming-${{ matrix.name }}
 
-  # ---------------------------------------------------------------------------
-  # 所有平台都构建成功后，自动把产物汇总成一个 Release。
-  #
-  # 触发条件就是「windows 和 cross 都成功」—— `needs` 保证这一点：
-  # 任何一个 job 失败或取消，这个 job 都会被跳过，不会发出残缺的 Release。
-  #
-  # tag 名 = 本次提交的 7 位短 SHA（如 3d462a5），工作流自己算并创建，不用手动打。
-  # 手动推 tag 也依然有效，那就用你推的那个 tag 名。
-  #
-  # 注意：用 GITHUB_TOKEN 创建的 tag 不会再触发新的 workflow（GitHub 的防递归规则），
-  # 所以不存在自己触发自己的循环。
-  # ---------------------------------------------------------------------------
+  # ===========================================================================
+  # Android / Termux。用 NDK 自带的 clang。
+  # 注意不能静态链接：Android 内核只认 PIE，需要 bionic 的动态装载器。
+  # ===========================================================================
+  android:
+    name: android-arm64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 生成 page.h
+        run: python3 src/mkpage.py
+
+      - name: 编译 android/arm64（NDK）
+        run: |
+          set -eux
+          NDK="${ANDROID_NDK_LATEST_HOME:-}"
+          if [ -z "$NDK" ] || [ ! -d "$NDK" ]; then
+            NDK="$(ls -d /usr/local/lib/android/sdk/ndk/*/ | tail -1)"
+          fi
+          echo "NDK: $NDK"
+          CC="${NDK%/}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang"
+          ls -la "$CC"
+          mkdir -p dist
+          "$CC" $CFLAGS -s -o dist/dming-android-arm64 src/dming.c
+          file dist/dming-android-arm64
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dming-android-arm64
+          if-no-files-found: error
+          path: dist/dming-android-arm64
+
+  # ===========================================================================
+  # macOS：必须在 macOS runner 上编（要 Apple SDK）。
+  # macos-latest 本身是 arm64，用 -arch 一次编出两个架构。
+  # ===========================================================================
+  macos:
+    name: macOS
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 生成 page.h
+        run: python3 src/mkpage.py
+
+      - name: 编译 darwin/amd64 与 darwin/arm64
+        run: |
+          set -eux
+          mkdir -p dist
+          for a in amd64 arm64; do
+            echo "=== darwin/$a ==="
+            clang $CFLAGS -arch "$a" -s -o "dist/dming-darwin-$a" src/dming.c
+            file "dist/dming-darwin-$a"
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dming-darwin
+          if-no-files-found: error
+          path: |
+            dist/dming-darwin-amd64
+            dist/dming-darwin-arm64
+
+  # ===========================================================================
+  # 所有平台都构建成功后，自动汇总成一个 Release。
+  # needs 保证任一平台失败就直接跳过，不会发出残缺的版本。
+  # ===========================================================================
   release:
     name: 发布 Release
-    needs: [windows, cross]
-    # PR 只构建不发版；push 和手动 Run workflow 都发。
+    needs: [windows, linux, android, macos]
     if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     permissions:
-      # 建 Release 和 tag 需要写权限，只给这个 job。
       contents: write
-    outputs:
-      tag: ${{ steps.tag.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
         with:
-          # 取完整历史，下面要按 SHA 反查提交信息。
           fetch-depth: 0
 
       - name: 决定 tag 名
         id: tag
         run: |
           set -euo pipefail
-
           if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
-            # 手动推了 tag，就用它
             TAG="${GITHUB_REF_NAME}"
           else
-            # 普通推送：tag 名取本提交的短 SHA
             TAG="$(git rev-parse --short=7 HEAD)"
           fi
-
-          # 不管哪种来源都校验一遍，避免发出指向不存在提交的 Release。
           if ! printf '%s' "$TAG" | grep -qE '^[0-9a-f]{4,40}$'; then
             echo "::error::tag 名 '$TAG' 不是十六进制短 SHA"
             exit 1
@@ -377,30 +315,21 @@ jobs:
             exit 1
           fi
           FULL="$(git rev-parse "$FULL")"
-          SHORT="$(git rev-parse --short=7 "$FULL")"
-
-          echo "tag        = $TAG"
-          echo "完整 SHA   = $FULL"
-          echo "规范短 SHA = $SHORT"
           echo "tag=$TAG"     >> "$GITHUB_OUTPUT"
           echo "full=$FULL"   >> "$GITHUB_OUTPUT"
-          echo "short=$SHORT" >> "$GITHUB_OUTPUT"
+          echo "short=$(git rev-parse --short=7 "$FULL")" >> "$GITHUB_OUTPUT"
 
       - name: 下载全部构建产物
         uses: actions/download-artifact@v4
         with:
           path: artifacts
 
-      # 下载下来的目录结构是 artifacts/<artifact名>/<文件>。
-      # 这里把要发布的东西挑出来，摊平到 release/ 下。
       - name: 整理发布文件
         run: |
           set -eux
           mkdir -p release
-          # Windows 绿色版和 exe 合集
           cp artifacts/dming-windows/dming-windows-portable.zip release/
           cp artifacts/dming-windows/dming-windows-exe.zip release/
-          # 其他平台，各自一个二进制
           for dir in artifacts/dming-linux-* artifacts/dming-darwin-* artifacts/dming-android-*; do
             [ -d "$dir" ] || continue
             for f in "$dir"/*; do
@@ -435,12 +364,12 @@ jobs:
             echo "|---|---|"
             echo "| \`dming-windows-portable.zip\` | **推荐**。解压即用，把 \`p.txt\` 换成你的名单，双击 \`dming.exe\` |"
             echo "| \`dming-windows-exe.zip\` | 只要 exe（386 / amd64 / arm64），自己配 \`p.txt\`、\`class.txt\` |"
-            echo "| \`dming-darwin-arm64\` / \`dming-darwin-amd64\` | macOS（Apple 芯片 / Intel） |"
+            echo "| \`dming-darwin-amd64\` / \`dming-darwin-arm64\` | macOS（Intel / Apple 芯片） |"
             echo "| \`dming-linux-amd64\` / \`dming-linux-arm64\` | Linux 64 位 |"
             echo "| \`dming-linux-386\` / \`dming-linux-arm\` | Linux 32 位（x86 / ARM） |"
-            echo "| \`dming-android-arm64\` | Termux（64 位 ARM） |"
+            echo "| \`dming-android-arm64\` | Termux |"
             echo
-            echo "绿色版里有两个备用 exe：32 位系统用 \`dming-386.exe\`，ARM64 设备用 \`dming-arm64.exe\`。"
+            echo "绿色版里有三个 exe：32 位系统用 \`dming-386.exe\`，ARM64 设备用 \`dming-arm64.exe\`。"
             echo
             echo "> macOS / Linux 首次运行可能需要去掉隔离属性："
             echo "> \`chmod +x dming-* && xattr -d com.apple.quarantine dming-darwin-arm64\`"
@@ -448,7 +377,6 @@ jobs:
             echo "绿色版里的 \`p.txt\` 是示例名单（张三、李四、王五、赵六），不含任何真实数据。"
           } > release_body.md
 
-          echo "--- 说明预览 ---"
           cat release_body.md
 
       - name: 创建 Release
@@ -456,7 +384,6 @@ jobs:
         with:
           name: ${{ steps.tag.outputs.short }}
           tag_name: ${{ steps.tag.outputs.tag }}
-          # tag 由本工作流创建时，钉在这次运行的提交上。
           target_commitish: ${{ github.sha }}
           body_path: release_body.md
           files: release/*
