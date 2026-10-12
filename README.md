@@ -181,6 +181,13 @@ Pre-Release 在 GitHub 上带 `Pre-release` 标记，也**不会**被算作 "Lat
 - **linux-amd64 那一步会真的把程序跑一遍**：造一个含空行、前后空格、CRLF、
   中文名的 `p.txt`，`cd /` 到别的目录执行，再断言生成的 HTML 里班级号、
   版本号和姓名数组都对。这是端到端测试，不是只看编译过没过。
+- 用到的 action 都升到了 **Node 24** 那条线（`checkout@v7`、`upload-artifact@v7`、
+  `download-artifact@v8`、`action-gh-release@v3`）—— 更早的主版本跑在 Node 20 上，
+  已经过时。写的是浮动主版本号，补丁会自动跟上；要更严的供应链安全就钉到 commit SHA。
+- **发 Release 前会断言产物一个不少**：按各 job 的结果反推该有哪些文件，缺一个就
+  报错中止。因为 `download-artifact@v8` 起「哈希不匹配」默认直接报错，而下载步骤
+  又加了 `continue-on-error`（构建不完整时要继续跑），不额外断言的话就可能出现
+  「构建报告成功、Release 也发了，但里面少文件」。
 
 ## 隐私
 

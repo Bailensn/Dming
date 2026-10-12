@@ -8,6 +8,13 @@ name: build
 #
 # 发版是自动的，不用手动打 tag：tag 名就是本次提交的 7 位短 SHA（如 3d462a5），
 # 由 release job 自己算并创建。任何一个平台构建失败，Release 就不会发。
+#
+# 用到的 action 版本（都跑在 Node 24 上，Node 20 那条线已经过时了）：
+#   actions/checkout@v7            （v4 是 node20）
+#   actions/upload-artifact@v7     （v4 是 node20）
+#   actions/download-artifact@v8   （v4 是 node20；v8 起哈希不匹配默认报错）
+#   softprops/action-gh-release@v3 （v2 是 node20）
+# 这些都是浮动主版本号，补丁会自动跟上。要更严的供应链安全就钉到 commit SHA。
 on:
   push:
     branches: [main, master]
@@ -38,7 +45,7 @@ jobs:
     name: Windows
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: 装工具链（mingw-w64 + llvm-mingw）
         run: |
@@ -182,7 +189,7 @@ jobs:
             dming-windows-386.exe dming-windows-amd64.exe dming-windows-arm64.exe
           unzip -l dming-windows-portable.zip
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: dming-windows
           if-no-files-found: error
@@ -208,7 +215,7 @@ jobs:
           - { name: linux-arm,   arch: arm,   cc: arm-linux-gnueabihf-gcc, apt: gcc-arm-linux-gnueabihf }
           - { name: linux-arm64, arch: arm64, cc: aarch64-linux-gnu-gcc,   apt: gcc-aarch64-linux-gnu }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: 生成 page.h
         run: python3 src/mkpage.py
@@ -246,7 +253,7 @@ jobs:
           grep -q 'let originalStudents = \["Alice","Bob","Carol","张三"\]' "$page"
           echo "OK: 页面内容正确"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: dming-${{ matrix.name }}
           if-no-files-found: error
@@ -260,7 +267,7 @@ jobs:
     name: android-arm64
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: 生成 page.h
         run: python3 src/mkpage.py
@@ -279,7 +286,7 @@ jobs:
           "$CC" $CFLAGS -s -o dist/dming-android-arm64 src/dming.c
           file dist/dming-android-arm64
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: dming-android-arm64
           if-no-files-found: error
@@ -293,7 +300,7 @@ jobs:
     name: macOS
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: 生成 page.h
         run: python3 src/mkpage.py
@@ -323,13 +330,13 @@ jobs:
       # 两个架构各一个 artifact。名字必须和 release job 里的
       # artifacts/dming-darwin-* 对得上，否则产物会被静默丢掉
       # （之前叫 dming-darwin，通配符匹配不到）。
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: dming-darwin-amd64
           if-no-files-found: error
           path: dist/dming-darwin-amd64
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: dming-darwin-arm64
           if-no-files-found: error
@@ -353,7 +360,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -409,7 +416,7 @@ jobs:
           echo "short=$(git rev-parse --short=7 "$FULL")" >> "$GITHUB_OUTPUT"
 
       - name: 下载全部构建产物
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
         # 有平台失败时可能一个产物都没有，别让它把整个 job 弄挂
@@ -495,8 +502,55 @@ jobs:
           echo "::error::所有平台都没构建成功，没有可发布的东西"
           exit 1
 
+      # 上面 download-artifact 加了 continue-on-error（构建不完整时要继续跑）。
+      # 但 download-artifact@v8 起，「下载哈希不匹配」默认是【直接报错】的，
+      # 那样会出现「构建报告成功、Release 也发了，但里面少文件」的情况。
+      # 所以这里按各 job 的结果反推该有哪些产物，缺一个都不放过。
+      - name: 断言该有的产物一个不少
+        env:
+          R_WINDOWS: ${{ needs.windows.result }}
+          R_LINUX: ${{ needs.linux.result }}
+          R_ANDROID: ${{ needs.android.result }}
+          R_MACOS: ${{ needs.macos.result }}
+        run: |
+          set -uo pipefail
+          missing=""
+          # 注意要始终返回 0，否则 set -e 会把整个脚本带出去
+          want() {
+            if [ ! -f "release/$1" ]; then
+              missing="$missing $1"
+            fi
+            return 0
+          }
+
+          if [ "$R_WINDOWS" = success ]; then
+            want dming-windows-portable.zip
+            want dming-windows-exe.zip
+          fi
+          if [ "$R_LINUX" = success ]; then
+            want dming-linux-amd64
+            want dming-linux-386
+            want dming-linux-arm
+            want dming-linux-arm64
+          fi
+          if [ "$R_MACOS" = success ]; then
+            want dming-darwin-amd64
+            want dming-darwin-arm64
+          fi
+          if [ "$R_ANDROID" = success ]; then
+            want dming-android-arm64
+          fi
+
+          if [ -n "$missing" ]; then
+            echo "::error::构建报告成功，但产物缺失:$missing"
+            echo "常见原因：artifact 下载失败（含哈希不匹配）、artifact 命名和收集规则对不上、"
+            echo "或者某个上传步骤被静默跳过。"
+            exit 1
+          fi
+          echo "OK: 该有的产物都在"
+
       - name: 创建 Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           name: ${{ steps.tag.outputs.short }}
           tag_name: ${{ steps.tag.outputs.tag }}
