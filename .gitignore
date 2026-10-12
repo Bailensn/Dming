@@ -1,7 +1,8 @@
 # 编译产物
 dist/
 *.exe
-*.syso
+*.o
+src/dming_res.o
 
 # 学生真实名单：绝对不要提交！仓库里用 p.sample.txt 当示例
 p.txt

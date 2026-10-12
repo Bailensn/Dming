@@ -1,64 +1,46 @@
 #!/usr/bin/env bash
-# 交叉编译 dming（Go 重写版点名器）。
+# 本地编译 dming（C 版）。
 #
-# 用法：
-#   ./build.sh                 # 编译全部桌面平台
-#   ./build.sh darwin/arm64    # 只编译指定平台
-#   ./build.sh android/arm64   # Termux / Android
+# 默认编当前平台：
+#   ./build.sh
 #
-# 产物输出到 dist/ 目录。
+# 指定交叉编译器（需要你自己装好对应工具链）：
+#   CC=x86_64-w64-mingw32-gcc EXT=.exe RC=x86_64-w64-mingw32-windres ./build.sh windows-amd64
+#
+# 多平台交叉编译在 GitHub Actions 里做（见 .github/workflows/build.yml），
+# 因为在本地凑齐 i686/x86_64/aarch64 三套 mingw 加各架构 Linux 工具链太麻烦。
 
 set -euo pipefail
 cd "$(dirname "$0")"
 
-APP="dming"
 OUT="dist"
-PKG="."
+CC="${CC:-cc}"
+EXT="${EXT:-}"
+RC="${RC:-}"
+TARGET="${1:-$(uname -s | tr 'A-Z' 'a-z')-$(uname -m)}"
+BIN="$OUT/dming-$TARGET$EXT"
 
-TARGETS=(
-	# 64 位
-	"linux/amd64"
-	"linux/arm64"
-	"darwin/amd64"
-	"darwin/arm64"
-	"windows/amd64"
-	"windows/arm64"
-	"android/arm64" # Termux
-	# 32 位
-	"linux/386"
-	"linux/arm"
-	"windows/386"
-)
-
-# 说明：
-#   - 想给 windows 产物嵌图标，先跑 rsrc 生成 rsrc_windows_<arch>.syso，
-#     详见 README 的「exe 图标（Windows）」。
-#   - Go 不支持 windows/arm（32 位 ARM Windows），darwin 也没有 32 位。
-#   - linux/arm 默认 GOARM=7；要支持更老的 ARMv6 设备就设 GOARM=6 重建。
-
-if [ "$#" -gt 0 ]; then
-	TARGETS=("$@")
-fi
-
-if ! command -v go >/dev/null 2>&1; then
-	echo "错误：没有找到 go 命令，请先安装 Go（版本要求见 go.mod）" >&2
-	exit 1
-fi
+CFLAGS="${CFLAGS:--std=c99 -O2 -Wall -Wextra}"
 
 mkdir -p "$OUT"
 
-for target in "${TARGETS[@]}"; do
-	os="${target%%/*}"
-	arch="${target##*/}"
-	ext=""
-	[ "$os" = "windows" ] && ext=".exe"
-	out="$OUT/$APP-$os-$arch$ext"
+echo "=== 生成 page.h ==="
+python3 src/mkpage.py
 
-	printf '  %-16s -> %s\n' "$target" "$out"
-	CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" \
-		go build -trimpath -ldflags "-s -w" -o "$out" "$PKG"
-done
+# Windows 的话顺手把图标和版本信息也编进去
+RES=""
+if [ -n "$RC" ] && command -v "$RC" >/dev/null 2>&1; then
+	echo "=== 编译资源（图标 + 版本信息）==="
+	( cd src && "$RC" dming.rc -O coff -o dming_res.o )
+	RES="src/dming_res.o"
+elif [ -n "$RC" ]; then
+	echo "警告：找不到 $RC，产物将不含图标和版本信息" >&2
+fi
+
+echo "=== 编译 $TARGET ==="
+# shellcheck disable=SC2086
+$CC $CFLAGS -o "$BIN" src/dming.c $RES
 
 echo
-echo "完成，产物在 $OUT/："
-ls -1 "$OUT"
+echo "完成: $BIN"
+ls -la "$BIN"

@@ -1,23 +1,9 @@
-package main
-
-import (
-	"bytes"
-	"encoding/json"
-	"html"
-	"text/template"
-)
-
-// pageTemplate 是点名页面的完整 HTML。占位符：
-//
-//	{{.Class}}      班级名称（已做 HTML 转义）
-//	{{.Version}}    版本号
-//	{{.StudentsJS}} 姓名数组，已是合法 JS 字面量
-const pageTemplate = `<!DOCTYPE html>
-<html lang="zh-CN">
+<!DOCTYPE html>
+<html lang='zh-CN'>
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>{{.Class}}班点名</title>
+<meta charset='UTF-8'>
+<meta name='viewport' content='width=device-width, initial-scale=1.0'>
+<title>{{CLASS}}班点名</title>
 <style>
 * {
 margin: 0;
@@ -260,24 +246,24 @@ font-size: 14px;
 </style>
 </head>
 <body>
-<div class="main-container">
-<span style="color: rgba(201, 208, 244, 1.0); text-align: center;">version {{.Version}}</span>
-<h1 class="app-title"><span id="classNum">{{.Class}}</span>班点名</h1>
-<div class="name-card" id="nameCard">
-<div class="name-text" id="currentName">准备就绪</div>
+<div class='main-container'>
+<span style='color: rgba(201, 208, 244, 1.0); text-align: center;'>version {{VERSION}}</span>
+<h1 class='app-title'><span id='classNum'>{{CLASS}}</span>班点名</h1>
+<div class='name-card' id='nameCard'>
+<div class='name-text' id='currentName'>准备就绪</div>
 </div>
-<div class="controls">
-<button class="control-btn" id="startStopBtn">开始点名</button>
-<button class="control-btn" id="resetBtn">重置名单</button>
+<div class='controls'>
+<button class='control-btn' id='startStopBtn'>开始点名</button>
+<button class='control-btn' id='resetBtn'>重置名单</button>
 </div>
-<div class="info-text" id="remainText">剩余 0 / 0 人</div>
-<div style="color: rgba(255, 255, 255, 0.6); font-size: 14px; margin-top: 20px; text-align: center;">
+<div class='info-text' id='remainText'>剩余 0 / 0 人</div>
+<div style='color: rgba(255, 255, 255, 0.6); font-size: 14px; margin-top: 20px; text-align: center;'>
 by 白异山
 </div>
 </div>
-<div class="toast" id="toast"></div>
+<div class='toast' id='toast'></div>
 <script>
-let originalStudents = {{.StudentsJS}};
+let originalStudents = {{STUDENTS}};
 let students = [...originalStudents];
 let currentIndex = 0;
 let isRolling = false;
@@ -353,7 +339,7 @@ updateRemain();
 }
 } else {
 if (students.length === 0) {
-alert("该名单无效，请重新获取");
+alert('该名单无效，请重新获取');
 return;
 }
 currentIndex = 0;
@@ -370,34 +356,9 @@ window.addEventListener('load', function() {
 if(students.length > 1) {
 currentIndex = 0;
 } else {
-alert("该名单无效，请重新获取");
+alert('该名单无效，请重新获取');
 }
 });
 </script>
 </body>
 </html>
-`
-
-var pageTmpl = template.Must(template.New("page").Parse(pageTemplate))
-
-// renderPage 生成最终页面；姓名以 JSON 数组的形式注入，避免引号 / 反斜杠破坏脚本。
-func renderPage(className string, students []string) ([]byte, error) {
-	names, err := json.Marshal(students)
-	if err != nil {
-		return nil, err
-	}
-	var buf bytes.Buffer
-	data := struct {
-		Class      string
-		Version    string
-		StudentsJS string
-	}{
-		Class:      html.EscapeString(className),
-		Version:    html.EscapeString(version),
-		StudentsJS: string(names),
-	}
-	if err := pageTmpl.Execute(&buf, data); err != nil {
-		return nil, err
-	}
-	return buf.Bytes(), nil
-}

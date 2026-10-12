@@ -1,13 +1,11 @@
 @echo off
 rem ---------------------------------------------------------------------------
-rem  Cross-compile dming for Windows / macOS / Linux / Android (Termux).
+rem  Build dming (C version) on Windows.
 rem
-rem  Usage:
-rem    build.bat                    build every desktop target
-rem    build.bat windows amd64      build one target
-rem    build.bat darwin/arm64       slash form is accepted too
+rem  Needs a C compiler on PATH - MinGW-w64 (gcc) or LLVM/Clang, either is fine.
+rem  windres is optional: without it the exe simply has no icon/version info.
 rem
-rem  Output goes to dist\.
+rem  The full multi-platform build runs on GitHub Actions.
 rem
 rem  This file is ASCII-only on purpose: cmd.exe decodes batch files using the
 rem  OEM code page, so UTF-8 text would show up as garbage.
@@ -16,73 +14,69 @@ rem ---------------------------------------------------------------------------
 setlocal
 cd /d "%~dp0"
 
-set APP=dming
 set OUT=dist
-set CGO_ENABLED=0
-
 if not exist "%OUT%" mkdir "%OUT%"
 
-if "%~1"=="" goto :buildall
-if not "%~2"=="" goto :buildpair
-rem one argument: accept the "os/arch" form
-for /f "tokens=1,2 delims=/" %%A in ("%~1") do call :build %%A %%B
-goto :done
+echo === Regenerating src\page.h ===
+python src\mkpage.py
+if errorlevel 1 goto :nopython
 
-:buildpair
-call :build %~1 %~2
-goto :done
+set CC=
+where gcc >nul 2>&1
+if not errorlevel 1 set CC=gcc
+if not defined CC (
+	where clang >nul 2>&1
+	if not errorlevel 1 set CC=clang
+)
+if not defined CC goto :nocc
 
-:buildall
-rem 64-bit
-call :build windows amd64
-if errorlevel 1 goto :fail
-call :build windows arm64
-if errorlevel 1 goto :fail
-call :build linux amd64
-if errorlevel 1 goto :fail
-call :build linux arm64
-if errorlevel 1 goto :fail
-call :build darwin amd64
-if errorlevel 1 goto :fail
-call :build darwin arm64
-if errorlevel 1 goto :fail
-call :build android arm64
-if errorlevel 1 goto :fail
-rem 32-bit
-rem Go has no windows/arm (32-bit ARM Windows), and no 32-bit darwin at all.
-rem android/arm is skipped too - 32-bit Android devices are basically gone.
-call :build windows 386
-if errorlevel 1 goto :fail
-call :build linux 386
-if errorlevel 1 goto :fail
-call :build linux arm
-if errorlevel 1 goto :fail
-
-:done
 echo.
-echo Done. Output in %OUT%\
+echo === Compiling with %CC% ===
+%CC% -std=c99 -O2 -Wall -Wextra -o "%OUT%\dming.exe" src\dming.c
+if errorlevel 1 goto :fail
+
+rem Icon + version info. Optional - a resource-less exe looks more suspicious
+rem to antivirus heuristics, so this is worth having, but it must not be fatal.
+set RC=
+where windres >nul 2>&1
+if not errorlevel 1 set RC=windres
+
+if defined RC (
+	echo.
+	echo === Compiling resources ^(icon + version info^) ===
+	pushd src
+	%RC% dming.rc -O coff -o dming_res.o
+	popd
+	if exist src\dming_res.o (
+		%CC% -std=c99 -O2 -s -o "%OUT%\dming.exe" src\dming.c src\dming_res.o -luser32
+		if errorlevel 1 goto :fail
+	) else (
+		echo Warning: windres failed - continuing without icon/version info.
+	)
+) else (
+	echo Warning: windres not found - the exe will have no icon or version info.
+)
+
+echo.
+echo Done: %OUT%\dming.exe
 dir /b "%OUT%"
 exit /b 0
 
-:build
-rem setlocal/endlocal keeps GOOS, GOARCH and EXT from leaking into later calls.
-setlocal
-set GOOS=%1
-set GOARCH=%2
-set EXT=
-if "%1"=="windows" set EXT=.exe
-echo   %1/%2 -^> %OUT%\%APP%-%1-%2%EXT%
-go build -trimpath -ldflags "-s -w" -o "%OUT%\%APP%-%1-%2%EXT%" .
-if errorlevel 1 (
-	endlocal
-	goto :fail
-)
-endlocal
-goto :eof
+
+:nopython
+echo.
+echo python was not found.
+echo It is only used to regenerate src\page.h from src\page.html.
+echo Install Python, or make sure src\page.h already exists.
+exit /b 1
+
+:nocc
+echo.
+echo No C compiler found on PATH.
+echo Install MinGW-w64 or LLVM/Clang, open a new terminal, then retry.
+exit /b 1
 
 :fail
-rem Nothing may run between the failed build and this exit: any command that
-rem succeeds would reset ERRORLEVEL to 0 and hide the failure from the caller.
 echo.
 echo BUILD FAILED.
 exit /b 1
