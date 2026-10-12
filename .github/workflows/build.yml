@@ -282,13 +282,19 @@ jobs:
             dist/dming-darwin-arm64
 
   # ===========================================================================
-  # 所有平台都构建成功后，自动汇总成一个 Release。
-  # needs 保证任一平台失败就直接跳过，不会发出残缺的版本。
+  # 汇总产物发 Release。
+  #
+  # 全部平台都成功 -> 正式 Release
+  # 有平台失败     -> 照样发，但标记成 Pre-Release（并列出哪些平台没出来）
+  #
+  # 所以这里的 if 用 !cancelled() 而不是默认的 success()：
+  # 不写的话，只要有一个构建 job 失败，这个 job 会被整个跳过，什么都发不出来。
+  # 用 ${{ }} 包起来是因为裸写 !cancelled() 时开头的 "!" 会被 YAML 当成标签。
   # ===========================================================================
   release:
     name: 发布 Release
     needs: [windows, linux, android, macos]
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    if: ${{ !cancelled() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -296,6 +302,35 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - name: 判断构建是否完整
+        id: complete
+        env:
+          R_WINDOWS: ${{ needs.windows.result }}
+          R_LINUX: ${{ needs.linux.result }}
+          R_ANDROID: ${{ needs.android.result }}
+          R_MACOS: ${{ needs.macos.result }}
+        run: |
+          set -euo pipefail
+          echo "windows=$R_WINDOWS linux=$R_LINUX android=$R_ANDROID macos=$R_MACOS"
+
+          : > incomplete.txt
+          for pair in "Windows:$R_WINDOWS" "Linux:$R_LINUX" "Android:$R_ANDROID" "macOS:$R_MACOS"; do
+            name="${pair%%:*}"
+            result="${pair##*:}"
+            if [ "$result" != "success" ]; then
+              printf -- '- **%s**：%s\n' "$name" "$result" >> incomplete.txt
+            fi
+          done
+
+          if [ -s incomplete.txt ]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::有平台没构建成功，本次将发布为 Pre-Release："
+            cat incomplete.txt
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+            echo "全部平台构建成功，发布正式 Release"
+          fi
 
       - name: 决定 tag 名
         id: tag
@@ -323,13 +358,21 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: artifacts
+        # 有平台失败时可能一个产物都没有，别让它把整个 job 弄挂
+        continue-on-error: true
 
       - name: 整理发布文件
         run: |
           set -eux
           mkdir -p release
-          cp artifacts/dming-windows/dming-windows-portable.zip release/
-          cp artifacts/dming-windows/dming-windows-exe.zip release/
+          # 用 `if [ -f ]` 逐个判断：构建不完整时某些产物本来就不存在
+          for f in dming-windows-portable.zip dming-windows-exe.zip; do
+            if [ -f "artifacts/dming-windows/$f" ]; then
+              cp "artifacts/dming-windows/$f" release/
+            else
+              echo "缺少 $f（windows job 没成功）"
+            fi
+          done
           for dir in artifacts/dming-linux-* artifacts/dming-darwin-* artifacts/dming-android-*; do
             [ -d "$dir" ] || continue
             for f in "$dir"/*; do
@@ -338,10 +381,15 @@ jobs:
           done
           echo "--- 待发布文件 ---"
           ls -la release/
+          count="$(find release -type f | wc -l)"
+          echo "共 $count 个文件"
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+        id: collect
 
       - name: 生成 Release 说明
         env:
           FULL_SHA: ${{ steps.tag.outputs.full }}
+          PRERELEASE: ${{ steps.complete.outputs.prerelease }}
         run: |
           set -euo pipefail
           SUBJECT="$(git log -1 --pretty=%s "$FULL_SHA")"
@@ -350,6 +398,14 @@ jobs:
           DATE="$(git log -1 --pretty=%ad --date=short "$FULL_SHA")"
 
           {
+            if [ "$PRERELEASE" = "true" ]; then
+              echo "> [!WARNING]"
+              echo "> **这是一个不完整的预发布版本。**"
+              echo "> 下列平台没有构建成功，对应的产物是缺失的，或者根本不存在："
+              echo ">"
+              sed 's/^-/> -/' incomplete.txt
+              echo
+            fi
             echo "提交 \`$FULL_SHA\` —— $DATE by $AUTHOR"
             echo
             echo "**$SUBJECT**"
@@ -379,6 +435,12 @@ jobs:
 
           cat release_body.md
 
+      - name: 一个产物都没有就别建 Release 了
+        if: steps.collect.outputs.count == '0'
+        run: |
+          echo "::error::所有平台都没构建成功，没有可发布的东西"
+          exit 1
+
       - name: 创建 Release
         uses: softprops/action-gh-release@v2
         with:
@@ -388,5 +450,7 @@ jobs:
           body_path: release_body.md
           files: release/*
           draft: false
-          prerelease: false
+          # 构建不完整就发成 Pre-Release（GitHub 上会带 Pre-release 标记，
+          # 也不会出现在 "Latest release" 里）
+          prerelease: ${{ steps.complete.outputs.prerelease }}
           fail_on_unmatched_files: true
