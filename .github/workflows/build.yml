@@ -97,12 +97,19 @@ jobs:
           echo "=== windows/arm64 ==="
           "$CC_A" $CFLAGS -s -o dist/dming-windows-arm64.exe src/dming.c $RES -luser32
 
-      - name: 校验三个 exe 里都真的有图标资源
+      - name: 校验 exe 里真的有图标资源
         run: |
+          set -eux
+          # 386 / amd64 用 apt 的 mingw，windres 一定有，缺了就是真出问题了
           python3 tools/check-pe.py \
             dist/dming-windows-386.exe \
-            dist/dming-windows-amd64.exe \
-            dist/dming-windows-arm64.exe
+            dist/dming-windows-amd64.exe
+
+          # arm64 走 llvm-mingw，它的 windres 不一定带。缺了只警告，
+          # 不因为它一个图标把整个 release 卡住。
+          if ! python3 tools/check-pe.py dist/dming-windows-arm64.exe; then
+            echo "::warning::windows/arm64 的 exe 没有图标资源（llvm-mingw 没提供 windres）"
+          fi
 
       - name: 组绿色版（中文说明直接写在 bash heredoc 里）
         run: |
@@ -267,19 +274,38 @@ jobs:
         run: |
           set -eux
           mkdir -p dist
-          for a in amd64 arm64; do
-            echo "=== darwin/$a ==="
-            clang $CFLAGS -arch "$a" -s -o "dist/dming-darwin-$a" src/dming.c
-            file "dist/dming-darwin-$a"
-          done
+
+          # -arch 要用 Apple 的叫法，不是 Go 的：
+          #   Intel -> x86_64   （写成 amd64 会报 invalid arch name）
+          #   Apple -> arm64
+          #
+          # 这里故意【不加 -s】。macOS（尤其 Apple 芯片）要求可执行文件至少带
+          # ad-hoc 签名，链接之后再 strip 会把签名弄坏，产物会被系统直接杀掉。
+          # 反正只有几十 KB，不值得为这点体积冒风险。
+          build() {
+            apple_arch="$1"   # x86_64 / arm64
+            name="$2"         # 产物文件名里用的名字
+            echo "=== darwin/$name (clang -arch $apple_arch) ==="
+            clang $CFLAGS -arch "$apple_arch" -o "dist/dming-darwin-$name" src/dming.c
+            file "dist/dming-darwin-$name"
+          }
+          build x86_64 amd64
+          build arm64  arm64
+
+      # 两个架构各一个 artifact。名字必须和 release job 里的
+      # artifacts/dming-darwin-* 对得上，否则产物会被静默丢掉
+      # （之前叫 dming-darwin，通配符匹配不到）。
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dming-darwin-amd64
+          if-no-files-found: error
+          path: dist/dming-darwin-amd64
 
       - uses: actions/upload-artifact@v4
         with:
-          name: dming-darwin
+          name: dming-darwin-arm64
           if-no-files-found: error
-          path: |
-            dist/dming-darwin-amd64
-            dist/dming-darwin-arm64
+          path: dist/dming-darwin-arm64
 
   # ===========================================================================
   # 汇总产物发 Release。
