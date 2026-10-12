@@ -92,7 +92,7 @@ HTML 属性统一用单引号，JS 字符串也用单引号。这样每行只要
 cd src
 windres dming.rc -O coff -o dming_res.o
 cd ..
-gcc -std=c99 -O2 -s -o dist\dming.exe src\dming.c src\dming_res.o -luser32
+gcc -std=gnu99 -O2 -s -o dist\dming.exe src\dming.c src\dming_res.o -luser32
 ```
 
 `build.bat` 会自动做这一步；找不到 `windres` 就跳过并给警告（不致命）。
@@ -142,8 +142,24 @@ tag 名由工作流自己算，就是本次提交的 **7 位短 SHA**（如 `3d4
 git push origin main     # 就这一条，剩下的全自动
 ```
 
-**任何平台构建失败就不会发版** —— 靠 `needs: [windows, linux, android, macos]`
-实现，被依赖的 job 失败时 release 会直接跳过。
+Release 分两种：
+
+| 情况 | 结果 |
+|---|---|
+| 全部平台构建成功 | **正式 Release** |
+| 有平台失败 / 被取消 | 照样发，但标记成 **Pre-Release**，并在说明顶部列出哪些平台没出来 |
+
+Pre-Release 在 GitHub 上带 `Pre-release` 标记，也**不会**被算作 "Latest release"，
+所以半成品不会被当成稳定版推给用户，但产物还是能下载来试。
+
+判断逻辑在 release job 里：读 `needs.<job>.result`，只要有一个不是 `success`
+就置 `prerelease=true`。所以那个 job 的 `if` 必须写 `!cancelled()` 而不是默认的
+`success()` —— 否则任一构建失败时整个 job 会被跳过，什么都发不出来。
+
+（顺带一提：`if` 得写成 `${{ !cancelled() && ... }}`。直接裸写 `!cancelled()`
+的话，开头的 `!` 会被 YAML 当成标签标记，脚本根本解析不了。）
+
+极端情况下所有平台都失败、一个产物都没有 —— 这时候直接报错退出，不建空 Release。
 
 > 副作用：**每推送一次 main 就产生一个 Release**。嫌吵的话把 release job 的
 > `if` 收窄成只在 `workflow_dispatch` 时才发。
@@ -165,6 +181,13 @@ git push origin main     # 就这一条，剩下的全自动
 - **linux-amd64 那一步会真的把程序跑一遍**：造一个含空行、前后空格、CRLF、
   中文名的 `p.txt`，`cd /` 到别的目录执行，再断言生成的 HTML 里班级号、
   版本号和姓名数组都对。这是端到端测试，不是只看编译过没过。
+- 用到的 action 都升到了 **Node 24** 那条线（`checkout@v7`、`upload-artifact@v7`、
+  `download-artifact@v8`、`action-gh-release@v3`）—— 更早的主版本跑在 Node 20 上，
+  已经过时。写的是浮动主版本号，补丁会自动跟上；要更严的供应链安全就钉到 commit SHA。
+- **发 Release 前会断言产物一个不少**：按各 job 的结果反推该有哪些文件，缺一个就
+  报错中止。因为 `download-artifact@v8` 起「哈希不匹配」默认直接报错，而下载步骤
+  又加了 `continue-on-error`（构建不完整时要继续跑），不额外断言的话就可能出现
+  「构建报告成功、Release 也发了，但里面少文件」。
 
 ## 隐私
 

@@ -21,6 +21,28 @@
  *   windres dming.rc -O coff -o dming_res.o && cc -O2 -o dming.exe dming.c dming_res.o -luser32
  */
 
+/*
+ * 特性宏必须在任何 #include 之前定义。
+ *
+ * 用 -std=c99（而不是 gnu99）时会定义 __STRICT_ANSI__，于是：
+ *   glibc -> 不再自动定义 _DEFAULT_SOURCE，_POSIX_C_SOURCE 也设不上，
+ *            __USE_POSIX 被关掉，readlink / fork / execvp / waitpid /
+ *            nanosleep / realpath 全部失去声明。
+ *   macOS -> __DARWIN_C_LEVEL 退化成 __DARWIN_C_ANSI，POSIX 声明一样被藏。
+ * 在 GCC 14 / Clang 下隐式声明是硬错误，直接编译失败。
+ *
+ * bionic（Android）不做这套隐藏，所以只有 Android 能编过 —— 这个差异很坑。
+ * 这里显式打开，配合构建脚本里的 -std=gnu99 双保险。
+ */
+#if !defined(_WIN32)
+#  ifndef _DEFAULT_SOURCE
+#    define _DEFAULT_SOURCE 1      /* glibc: 打开 POSIX + BSD 声明 */
+#  endif
+#  ifndef _DARWIN_C_SOURCE
+#    define _DARWIN_C_SOURCE 1     /* macOS: 打开全部声明（其他平台无副作用） */
+#  endif
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -48,10 +70,13 @@
 #ifdef _WIN32
 #  define WIN32_LEAN_AND_MEAN
 #  include <windows.h>
+#  include <shellapi.h>   /* ShellExecuteW —— 不在 windows.h 里，漏了会编译失败 */
+#  include <wchar.h>      /* wcslen / wcsrchr */
 typedef wchar_t pchar;
 #  define PLIT_(s) L##s
 #  define PATH_SEP L'\\'
 #else
+#  include <sys/types.h>  /* pid_t / ssize_t，别指望 unistd.h 一定会带进来 */
 #  include <unistd.h>
 #  include <sys/stat.h>
 #  include <sys/wait.h>
@@ -248,8 +273,13 @@ static pchar *exe_dir(const char *argv0)
 {
 #ifdef _WIN32
     wchar_t buf[32768];
-    DWORD n = GetModuleFileNameW(NULL, buf, (DWORD)(sizeof buf / sizeof buf[0]));
+    DWORD n;
     wchar_t *s;
+
+    /* GetModuleFileNameW 在 Windows 上足够可靠，不用 argv[0] 兜底 */
+    (void)argv0;
+
+    n = GetModuleFileNameW(NULL, buf, (DWORD)(sizeof buf / sizeof buf[0]));
     if (n == 0 || n >= (DWORD)(sizeof buf / sizeof buf[0]))
         return NULL;
     s = wcsrchr(buf, L'\\');
@@ -535,7 +565,14 @@ static void add_first_cb(void *ud, const char *s, size_t len)
  * 转义
  * ========================================================================== */
 
-/* 注入 JS 数组用：转义 " \ 和控制字符，UTF-8 原样透传 */
+/*
+ * 注入 JS 数组用：转义 " \ 和 < > &，UTF-8 原样透传。
+ *
+ * < > & 并不是 JSON 语法要求的，但这段 JSON 是嵌在 HTML 的 <script> 里的：
+ * 姓名要是含 "</script>"（或者 "<script>"），就会冲出脚本块变成 HTML，
+ * 轻则页面崩掉，重则被当成注入。转成 \u003c 之后 JS 解析出来还是原字符，
+ * 显示完全一样，但不可能再冲出标签。这是「JSON 嵌 HTML」的标准做法。
+ */
 static void json_escape(Buf *out, const char *s)
 {
     const unsigned char *p = (const unsigned char *)s;
@@ -546,6 +583,9 @@ static void json_escape(Buf *out, const char *s)
         case '\n': buf_puts(out, "\\n");  break;
         case '\r': buf_puts(out, "\\r");  break;
         case '\t': buf_puts(out, "\\t");  break;
+        case '<':  buf_puts(out, "\\u003c"); break;
+        case '>':  buf_puts(out, "\\u003e"); break;
+        case '&':  buf_puts(out, "\\u0026"); break;
         default:
             if (*p < 0x20) {
                 char tmp[8];
@@ -607,13 +647,21 @@ static int try_exec(char *const argv[])
 {
     pid_t pid = fork();
     int status = 0;
+    pid_t w;
+
     if (pid < 0)
         return -1;
     if (pid == 0) {
         execvp(argv[0], argv);
         _exit(127);          /* 127 = 找不到命令 */
     }
-    if (waitpid(pid, &status, 0) < 0)
+
+    /* waitpid 可能被信号打断（EINTR），那不是失败，要接着等 */
+    do {
+        w = waitpid(pid, &status, 0);
+    } while (w < 0 && errno == EINTR);
+
+    if (w < 0)
         return -1;
     if (WIFEXITED(status) && WEXITSTATUS(status) == 127)
         return -1;
@@ -701,19 +749,34 @@ static void usage(FILE *out, const char *argv0)
         APP_NAME, APP_VERSION, APP_DESC, argv0);
 }
 
-/* "8s" / "800ms" / "8"（裸数字按秒） */
+/*
+ * "8s" / "800ms" / "8"（裸数字按秒）。
+ *
+ * 上限 24 小时：strtol 溢出时会返回 LONG_MAX，后面再乘 1000 就是有符号溢出
+ * （未定义行为）。所以必须在乘法【之前】卡住，不能先算再判断。
+ */
 static int parse_delay(const char *s, int *out_ms)
 {
     char *end = NULL;
     long v = strtol(s, &end, 10);
+    long ms;
+
     if (end == s || v < 0)
         return -1;
-    if (*end == '\0' || strcmp(end, "s") == 0)
-        *out_ms = (int)(v * 1000);
-    else if (strcmp(end, "ms") == 0)
-        *out_ms = (int)v;
-    else
+
+    if (*end == '\0' || strcmp(end, "s") == 0) {
+        if (v > 86400L)
+            return -1;
+        ms = v * 1000L;
+    } else if (strcmp(end, "ms") == 0) {
+        if (v > 86400000L)
+            return -1;
+        ms = v;
+    } else {
         return -1;
+    }
+
+    *out_ms = (int)ms;
     return 0;
 }
 
