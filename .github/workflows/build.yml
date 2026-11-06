@@ -1,20 +1,5 @@
 name: build
 
-# 什么时候跑：
-#   - 推送到 main / master  -> 构建全部平台，全绿之后【自动发 Release】
-#   - 手动：Actions 页面 Run workflow  -> 同上，也会发 Release
-#   - PR                    -> 只构建验证，不发 Release
-#   - 推 tag                -> 也发，Release 挂在你推的那个 tag 上
-#
-# 发版是自动的，不用手动打 tag：tag 名就是本次提交的 7 位短 SHA（如 3d462a5），
-# 由 release job 自己算并创建。任何一个平台构建失败，Release 就不会发。
-#
-# 用到的 action 版本（都跑在 Node 24 上，Node 20 那条线已经过时了）：
-#   actions/checkout@v7            （v4 是 node20）
-#   actions/upload-artifact@v7     （v4 是 node20）
-#   actions/download-artifact@v8   （v4 是 node20；v8 起哈希不匹配默认报错）
-#   softprops/action-gh-release@v3 （v2 是 node20）
-# 这些都是浮动主版本号，补丁会自动跟上。要更严的供应链安全就钉到 commit SHA。
 on:
   push:
     branches: [main, master]
@@ -22,7 +7,6 @@ on:
   pull_request:
   workflow_dispatch:
 
-# 默认只读；发 Release 需要写权限，在 release job 里单独提权。
 permissions:
   contents: read
 
@@ -30,17 +14,6 @@ env:
   CFLAGS: -std=gnu99 -O2 -Wall -Wextra
 
 jobs:
-  # ===========================================================================
-  # Windows：在 ubuntu 上用 mingw 交叉编译。
-  #
-  # 放 ubuntu 而不是 windows runner，有两个好处：
-  #   1. runner 更快
-  #   2. 打包（绿色版目录 + 含中文文件名的 zip）走 bash + zip，
-  #      完全没有 PowerShell 那套编码坑
-  #
-  # Debian/Ubuntu 的 mingw-w64 只提供 i686 和 x86_64，
-  # aarch64 得用 llvm-mingw。
-  # ===========================================================================
   windows:
     name: Windows
     runs-on: ubuntu-latest
@@ -53,34 +26,25 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq gcc-mingw-w64-i686 gcc-mingw-w64-x86-64
 
-          # aarch64 用 llvm-mingw，版本写死以保证构建可复现
           LM=llvm-mingw-20261006-ucrt-ubuntu-22.04-x86_64
           curl -fsSL -o /tmp/llvm-mingw.tar.xz \
             "https://github.com/mstorsjo/llvm-mingw/releases/download/20261006/${LM}.tar.xz"
           sudo tar -xJf /tmp/llvm-mingw.tar.xz -C /opt
           echo "/opt/${LM}/bin" >> "$GITHUB_PATH"
 
-      - name: 生成 page.h
-        run: python3 src/mkpage.py
-
       - name: 编译 windows/386 与 windows/amd64
         run: |
           set -eux
           mkdir -p dist
 
-          # Windows 上刻意【不加 -s】。剥离符号表只省 3 KB 左右，但会让 PE
-          # 更接近「无符号 + 导入表极小 + 无资源」的加壳特征。宁可留着符号，
-          # 让它看起来就是普通 mingw 编译产物。
-          # --dynamicbase / --nxcompat 显式要求 ASLR + DEP，现代正规程序都有，
-          # 缺了反而可疑（老式木马就没有）。
           WFLAGS="$CFLAGS -Wl,--dynamicbase -Wl,--nxcompat"
 
           build() {
             arch="$1"; cc="$2"; rc="$3"
             echo "=== windows/$arch ==="
-            ( cd src && "$rc" dming.rc -O coff -o dming_res.o )
+            "$rc" dming.rc -O coff -o dming_res.o
             "$cc" $WFLAGS -o "dist/dming-windows-$arch.exe" \
-              src/dming.c src/dming_res.o -lshell32 -luser32
+              dming.c dming_res.o -lshell32 -luser32
           }
           build 386   i686-w64-mingw32-gcc   i686-w64-mingw32-windres
           build amd64 x86_64-w64-mingw32-gcc x86_64-w64-mingw32-windres
@@ -92,7 +56,6 @@ jobs:
           WFLAGS="$CFLAGS -Wl,--dynamicbase -Wl,--nxcompat"
           command -v "$CC_A" >/dev/null || { echo "找不到 $CC_A"; exit 1; }
 
-          # llvm-mingw 通常提供 <triple>-windres；没有就退回 llvm-windres
           if command -v aarch64-w64-mingw32-windres >/dev/null 2>&1; then
             RC_A=aarch64-w64-mingw32-windres
           elif command -v llvm-windres >/dev/null 2>&1; then
@@ -104,45 +67,59 @@ jobs:
           RES=""
           if [ -n "$RC_A" ]; then
             echo "=== 资源编译器: $RC_A ==="
-            ( cd src && $RC_A dming.rc -O coff -o dming_res.o )
-            RES=src/dming_res.o
+            $RC_A dming.rc -O coff -o dming_res.o
+            RES=dming_res.o
           else
             echo "::warning::没有 aarch64 的 windres，windows/arm64 将不含图标和版本信息"
           fi
 
           echo "=== windows/arm64 ==="
-          "$CC_A" $WFLAGS -o dist/dming-windows-arm64.exe src/dming.c $RES -lshell32 -luser32
+          "$CC_A" $WFLAGS -o dist/dming-windows-arm64.exe dming.c $RES -lshell32 -luser32
 
       - name: 校验版本号两处一致
         run: |
           set -eux
-          # 版本号写在两个地方：dming.c 的 APP_VERSION 和 dming.rc 的
-          # FILEVERSION / FileVersion。改一处忘另一处的话，exe 属性里会显示
-          # 错版本，所以这里直接拦下来。
-          V="$(sed -n 's/^#define APP_VERSION "\([0-9.]*\)".*/\1/p' src/dming.c)"
+          V="$(sed -n 's/^#define APP_VERSION "\([0-9.]*\)".*/\1/p' dming.c)"
           test -n "$V" || { echo "::error::没能从 dming.c 里读出 APP_VERSION"; exit 1; }
           echo "dming.c APP_VERSION = $V"
 
           DOTTED="$(printf '%s' "$V" | tr . ,)"
-          grep -qE "^FILEVERSION[[:space:]]+$DOTTED,0" src/dming.rc \
+          grep -qE "^FILEVERSION[[:space:]]+$DOTTED,0" dming.rc \
             || { echo "::error::dming.rc 的 FILEVERSION 和 $V 对不上"; exit 1; }
-          grep -qE "^PRODUCTVERSION[[:space:]]+$DOTTED,0" src/dming.rc \
+          grep -qE "^PRODUCTVERSION[[:space:]]+$DOTTED,0" dming.rc \
             || { echo "::error::dming.rc 的 PRODUCTVERSION 和 $V 对不上"; exit 1; }
-          grep -q "\"$V.0\"" src/dming.rc \
+          grep -q "\"$V.0\"" dming.rc \
             || { echo "::error::dming.rc 的字符串版本号和 $V 对不上"; exit 1; }
           echo "OK: 两处版本一致"
 
       - name: 校验 exe 里真的有图标资源
         run: |
           set -eux
-          # 386 / amd64 用 apt 的 mingw，windres 一定有，缺了就是真出问题了
-          python3 tools/check-pe.py \
+          cat > /tmp/check_pe.py <<'PY'
+          import struct, sys
+
+          def sections(path):
+              d = open(path, 'rb').read()
+              assert d[:2] == b'MZ', path + ': 不是 PE'
+              pe = struct.unpack_from('<I', d, 0x3C)[0]
+              assert d[pe:pe + 4] == b'PE\0\0', path + ': 没有 PE 签名'
+              nsec = struct.unpack_from('<H', d, pe + 6)[0]
+              off = pe + 24 + struct.unpack_from('<H', d, pe + 20)[0]
+              return [d[off + i*40: off + i*40 + 8].split(b'\0')[0].decode()
+                      for i in range(nsec)]
+
+          bad = [p for p in sys.argv[1:] if '.rsrc' not in sections(p)]
+          if bad:
+              print('缺少 .rsrc（图标/版本信息没链接进去）:', ' '.join(bad),
+                    file=sys.stderr)
+              sys.exit(1)
+          PY
+
+          python3 /tmp/check_pe.py \
             dist/dming-windows-386.exe \
             dist/dming-windows-amd64.exe
 
-          # arm64 走 llvm-mingw，它的 windres 不一定带。缺了只警告，
-          # 不因为它一个图标把整个 release 卡住。
-          if ! python3 tools/check-pe.py dist/dming-windows-arm64.exe; then
+          if ! python3 /tmp/check_pe.py dist/dming-windows-arm64.exe; then
             echo "::warning::windows/arm64 的 exe 没有图标资源（llvm-mingw 没提供 windres）"
           fi
 
@@ -154,9 +131,8 @@ jobs:
           cp dist/dming-windows-amd64.exe "$P/dming.exe"
           cp dist/dming-windows-386.exe   "$P/dming-386.exe"
           cp dist/dming-windows-arm64.exe "$P/dming-arm64.exe"
-          cp class.txt "$P/"
-          cp p.sample.txt "$P/p.txt"
-          cp assets/dming.ico "$P/"
+          printf '高一(1)班\n' > "$P/class.txt"
+          printf '张三\n李四\n王五\n赵六\n' > "$P/p.txt"
           cat > "$P/使用说明.txt" <<'EOF'
           免安装版，解压即用。
 
@@ -200,42 +176,32 @@ jobs:
             dist/dming-portable/
             dist/*.zip
 
-  # ===========================================================================
-  # Linux 各架构。全部静态链接，免得依赖构建机的 glibc 版本。
-  # ===========================================================================
   linux:
-    name: ${{ matrix.name }}
+    name: linux
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { name: linux-amd64, arch: amd64, cc: gcc,                     apt: "" }
-          - { name: linux-386,   arch: 386,   cc: "gcc -m32",              apt: gcc-multilib }
-          - { name: linux-arm,   arch: arm,   cc: arm-linux-gnueabihf-gcc, apt: gcc-arm-linux-gnueabihf }
-          - { name: linux-arm64, arch: arm64, cc: aarch64-linux-gnu-gcc,   apt: gcc-aarch64-linux-gnu }
     steps:
       - uses: actions/checkout@v7
 
-      - name: 生成 page.h
-        run: python3 src/mkpage.py
-
-      - name: 装交叉编译器
-        if: matrix.apt != ''
+      - name: 装 zig
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq ${{ matrix.apt }}
+          set -eux
+          curl -fsSL -o /tmp/zig.tar.xz https://ziglang.org/download/0.17.1/zig-x86_64-linux-0.17.1.tar.xz
+          tar -xJf /tmp/zig.tar.xz -C "$HOME"
+          mv "$HOME/zig-x86_64-linux-0.17.1" "$HOME/zig"
+          echo "$HOME/zig" >> "$GITHUB_PATH"
 
-      - name: 编译 ${{ matrix.name }}
+      - name: 编译 4 个架构
         run: |
           set -eux
           mkdir -p dist
-          ${{ matrix.cc }} $CFLAGS -static -s -o "dist/dming-${{ matrix.name }}" src/dming.c
-          file "dist/dming-${{ matrix.name }}"
+          for pair in x86_64-linux-musl:amd64 x86-linux-musl:386 arm-linux-musleabihf:arm aarch64-linux-musl:arm64; do
+            triple="${pair%%:*}"
+            arch="${pair##*:}"
+            zig cc -target "$triple" $CFLAGS -o "dist/dming-linux-$arch" dming.c
+            file "dist/dming-linux-$arch"
+          done
 
-      # 原生架构就真跑一遍，算端到端冒烟测试
-      - name: 冒烟测试（只在 linux-amd64 上跑）
-        if: matrix.arch == 'amd64'
+      - name: 冒烟测试（真跑 amd64 产物）
         run: |
           set -eux
           T="$(mktemp -d)"
@@ -243,34 +209,27 @@ jobs:
           printf 'Alice\nBob\n\n  Carol  \n张三\r\n' > "$T/p.txt"
           printf '14\n' > "$T/class.txt"
 
-          # 故意 cd 到别处，验证它读的是 exe 所在目录而不是当前目录
           ( cd / && "$T/dming" -no-open )
 
           page="$(ls "$T"/DMING*.html)"
           echo "生成的页面: $page"
           grep -q '<title>14班点名</title>' "$page"
-          grep -q 'version 3.4.3' "$page"
+          V="$(sed -n 's/^#define APP_VERSION "\([0-9.]*\)".*/\1/p' dming.c)"
+          grep -q "version $V" "$page"
           grep -q 'let originalStudents = \["Alice","Bob","Carol","张三"\]' "$page"
           echo "OK: 页面内容正确"
 
       - uses: actions/upload-artifact@v7
         with:
-          name: dming-${{ matrix.name }}
+          name: dming-linux
           if-no-files-found: error
-          path: dist/dming-${{ matrix.name }}
+          path: dist/dming-linux-*
 
-  # ===========================================================================
-  # Android / Termux。用 NDK 自带的 clang。
-  # 注意不能静态链接：Android 内核只认 PIE，需要 bionic 的动态装载器。
-  # ===========================================================================
   android:
     name: android-arm64
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-
-      - name: 生成 page.h
-        run: python3 src/mkpage.py
 
       - name: 编译 android/arm64（NDK）
         run: |
@@ -283,7 +242,7 @@ jobs:
           CC="${NDK%/}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang"
           ls -la "$CC"
           mkdir -p dist
-          "$CC" $CFLAGS -s -o dist/dming-android-arm64 src/dming.c
+          "$CC" $CFLAGS -s -o dist/dming-android-arm64 dming.c
           file dist/dming-android-arm64
 
       - uses: actions/upload-artifact@v7
@@ -292,69 +251,9 @@ jobs:
           if-no-files-found: error
           path: dist/dming-android-arm64
 
-  # ===========================================================================
-  # macOS：必须在 macOS runner 上编（要 Apple SDK）。
-  # macos-latest 本身是 arm64，用 -arch 一次编出两个架构。
-  # ===========================================================================
-  macos:
-    name: macOS
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: 生成 page.h
-        run: python3 src/mkpage.py
-
-      - name: 编译 darwin/amd64 与 darwin/arm64
-        run: |
-          set -eux
-          mkdir -p dist
-
-          # -arch 要用 Apple 的叫法，不是 Go 的：
-          #   Intel -> x86_64   （写成 amd64 会报 invalid arch name）
-          #   Apple -> arm64
-          #
-          # 这里故意【不加 -s】。macOS（尤其 Apple 芯片）要求可执行文件至少带
-          # ad-hoc 签名，链接之后再 strip 会把签名弄坏，产物会被系统直接杀掉。
-          # 反正只有几十 KB，不值得为这点体积冒风险。
-          build() {
-            apple_arch="$1"   # x86_64 / arm64
-            name="$2"         # 产物文件名里用的名字
-            echo "=== darwin/$name (clang -arch $apple_arch) ==="
-            clang $CFLAGS -arch "$apple_arch" -o "dist/dming-darwin-$name" src/dming.c
-            file "dist/dming-darwin-$name"
-          }
-          build x86_64 amd64
-          build arm64  arm64
-
-      # 两个架构各一个 artifact。名字必须和 release job 里的
-      # artifacts/dming-darwin-* 对得上，否则产物会被静默丢掉
-      # （之前叫 dming-darwin，通配符匹配不到）。
-      - uses: actions/upload-artifact@v7
-        with:
-          name: dming-darwin-amd64
-          if-no-files-found: error
-          path: dist/dming-darwin-amd64
-
-      - uses: actions/upload-artifact@v7
-        with:
-          name: dming-darwin-arm64
-          if-no-files-found: error
-          path: dist/dming-darwin-arm64
-
-  # ===========================================================================
-  # 汇总产物发 Release。
-  #
-  # 全部平台都成功 -> 正式 Release
-  # 有平台失败     -> 照样发，但标记成 Pre-Release（并列出哪些平台没出来）
-  #
-  # 所以这里的 if 用 !cancelled() 而不是默认的 success()：
-  # 不写的话，只要有一个构建 job 失败，这个 job 会被整个跳过，什么都发不出来。
-  # 用 ${{ }} 包起来是因为裸写 !cancelled() 时开头的 "!" 会被 YAML 当成标签。
-  # ===========================================================================
   release:
     name: 发布 Release
-    needs: [windows, linux, android, macos]
+    needs: [windows, linux, android]
     if: ${{ !cancelled() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
     runs-on: ubuntu-latest
     permissions:
@@ -370,13 +269,12 @@ jobs:
           R_WINDOWS: ${{ needs.windows.result }}
           R_LINUX: ${{ needs.linux.result }}
           R_ANDROID: ${{ needs.android.result }}
-          R_MACOS: ${{ needs.macos.result }}
         run: |
           set -euo pipefail
-          echo "windows=$R_WINDOWS linux=$R_LINUX android=$R_ANDROID macos=$R_MACOS"
+          echo "windows=$R_WINDOWS linux=$R_LINUX android=$R_ANDROID"
 
           : > incomplete.txt
-          for pair in "Windows:$R_WINDOWS" "Linux:$R_LINUX" "Android:$R_ANDROID" "macOS:$R_MACOS"; do
+          for pair in "Windows:$R_WINDOWS" "Linux:$R_LINUX" "Android:$R_ANDROID"; do
             name="${pair%%:*}"
             result="${pair##*:}"
             if [ "$result" != "success" ]; then
@@ -419,14 +317,12 @@ jobs:
         uses: actions/download-artifact@v8
         with:
           path: artifacts
-        # 有平台失败时可能一个产物都没有，别让它把整个 job 弄挂
         continue-on-error: true
 
       - name: 整理发布文件
         run: |
           set -eux
           mkdir -p release
-          # 用 `if [ -f ]` 逐个判断：构建不完整时某些产物本来就不存在
           for f in dming-windows-portable.zip dming-windows-exe.zip; do
             if [ -f "artifacts/dming-windows/$f" ]; then
               cp "artifacts/dming-windows/$f" release/
@@ -434,7 +330,7 @@ jobs:
               echo "缺少 $f（windows job 没成功）"
             fi
           done
-          for dir in artifacts/dming-linux-* artifacts/dming-darwin-* artifacts/dming-android-*; do
+          for dir in artifacts/dming-linux artifacts/dming-android-*; do
             [ -d "$dir" ] || continue
             for f in "$dir"/*; do
               [ -f "$f" ] && cp "$f" release/
@@ -481,15 +377,13 @@ jobs:
             echo "|---|---|"
             echo "| \`dming-windows-portable.zip\` | **推荐**。解压即用，把 \`p.txt\` 换成你的名单，双击 \`dming.exe\` |"
             echo "| \`dming-windows-exe.zip\` | 只要 exe（386 / amd64 / arm64），自己配 \`p.txt\`、\`class.txt\` |"
-            echo "| \`dming-darwin-amd64\` / \`dming-darwin-arm64\` | macOS（Intel / Apple 芯片） |"
             echo "| \`dming-linux-amd64\` / \`dming-linux-arm64\` | Linux 64 位 |"
             echo "| \`dming-linux-386\` / \`dming-linux-arm\` | Linux 32 位（x86 / ARM） |"
             echo "| \`dming-android-arm64\` | Termux |"
             echo
             echo "绿色版里有三个 exe：32 位系统用 \`dming-386.exe\`，ARM64 设备用 \`dming-arm64.exe\`。"
             echo
-            echo "> macOS / Linux 首次运行可能需要去掉隔离属性："
-            echo "> \`chmod +x dming-* && xattr -d com.apple.quarantine dming-darwin-arm64\`"
+            echo "> Linux 首次运行需要加执行权限：\`chmod +x dming-*\`"
             echo
             echo "绿色版里的 \`p.txt\` 是示例名单（张三、李四、王五、赵六），不含任何真实数据。"
           } > release_body.md
@@ -502,20 +396,14 @@ jobs:
           echo "::error::所有平台都没构建成功，没有可发布的东西"
           exit 1
 
-      # 上面 download-artifact 加了 continue-on-error（构建不完整时要继续跑）。
-      # 但 download-artifact@v8 起，「下载哈希不匹配」默认是【直接报错】的，
-      # 那样会出现「构建报告成功、Release 也发了，但里面少文件」的情况。
-      # 所以这里按各 job 的结果反推该有哪些产物，缺一个都不放过。
       - name: 断言该有的产物一个不少
         env:
           R_WINDOWS: ${{ needs.windows.result }}
           R_LINUX: ${{ needs.linux.result }}
           R_ANDROID: ${{ needs.android.result }}
-          R_MACOS: ${{ needs.macos.result }}
         run: |
           set -uo pipefail
           missing=""
-          # 注意要始终返回 0，否则 set -e 会把整个脚本带出去
           want() {
             if [ ! -f "release/$1" ]; then
               missing="$missing $1"
@@ -532,10 +420,6 @@ jobs:
             want dming-linux-386
             want dming-linux-arm
             want dming-linux-arm64
-          fi
-          if [ "$R_MACOS" = success ]; then
-            want dming-darwin-amd64
-            want dming-darwin-arm64
           fi
           if [ "$R_ANDROID" = success ]; then
             want dming-android-arm64
@@ -558,7 +442,5 @@ jobs:
           body_path: release_body.md
           files: release/*
           draft: false
-          # 构建不完整就发成 Pre-Release（GitHub 上会带 Pre-release 标记，
-          # 也不会出现在 "Latest release" 里）
           prerelease: ${{ steps.complete.outputs.prerelease }}
           fail_on_unmatched_files: true

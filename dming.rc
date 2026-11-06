@@ -1,0 +1,33 @@
+#include <windows.h>
+
+1 ICON "dming.ico"
+
+1 VERSIONINFO
+FILEVERSION     3,5,2,0
+PRODUCTVERSION  3,5,2,0
+FILEFLAGSMASK   0x3fL
+FILEFLAGS       0x0L
+FILEOS          VOS_NT_WINDOWS32
+FILETYPE        VFT_APP
+FILESUBTYPE     VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName",      "Bailensn"
+            VALUE "FileDescription",  "dming - classroom random name picker"
+            VALUE "FileVersion",      "3.5.2.0"
+            VALUE "InternalName",     "dming"
+            VALUE "LegalCopyright",   "Apache License 2.0"
+            VALUE "OriginalFilename", "dming.exe"
+            VALUE "ProductName",      "dming"
+            VALUE "ProductVersion",   "3.5.2.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END
