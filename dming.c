@@ -1,45 +1,6 @@
-/*
- * dming —— 课堂随机点名器（纯 C 实现）
- *
- * 从「可执行文件所在目录」读取两个文本文件：
- *
- *   p.txt      每行一个学生姓名（空行忽略）
- *   class.txt  班级名称，取第一个非空行
- *
- * 生成一个临时 HTML 页面（DMING*.html）用系统默认浏览器打开，
- * 等待若干秒后删除，可用 -keep 保留。
- *
- * 支持 Windows / macOS / Linux / Android(Termux)。
- *
- * 为什么不用 Go：Go 链接出的 PE 结构特殊（没有常规 CRT、节表不寻常），
- * 国内杀软的启发式引擎很容易把未签名的 Go 程序误判成木马。用系统自带
- * C 工具链编出的常规 PE，误报率低得多。
- *
- * 编译见 build.sh / build.bat，也可以直接：
- *   cc -O2 -o dming dming.c
- * Windows 上加资源（图标 + 版本信息）：
- *   windres dming.rc -O coff -o dming_res.o && cc -O2 -o dming.exe dming.c dming_res.o -luser32
- */
-
-/*
- * 特性宏必须在任何 #include 之前定义。
- *
- * 用 -std=c99（而不是 gnu99）时会定义 __STRICT_ANSI__，于是：
- *   glibc -> 不再自动定义 _DEFAULT_SOURCE，_POSIX_C_SOURCE 也设不上，
- *            __USE_POSIX 被关掉，readlink / fork / execvp / waitpid /
- *            nanosleep / realpath 全部失去声明。
- *   macOS -> __DARWIN_C_LEVEL 退化成 __DARWIN_C_ANSI，POSIX 声明一样被藏。
- * 在 GCC 14 / Clang 下隐式声明是硬错误，直接编译失败。
- *
- * bionic（Android）不做这套隐藏，所以只有 Android 能编过 —— 这个差异很坑。
- * 这里显式打开，配合构建脚本里的 -std=gnu99 双保险。
- */
 #if !defined(_WIN32)
 #  ifndef _DEFAULT_SOURCE
-#    define _DEFAULT_SOURCE 1      /* glibc: 打开 POSIX + BSD 声明 */
-#  endif
-#  ifndef _DARWIN_C_SOURCE
-#    define _DARWIN_C_SOURCE 1     /* macOS: 打开全部声明（其他平台无副作用） */
+#    define _DEFAULT_SOURCE 1
 #  endif
 #endif
 
@@ -49,49 +10,488 @@
 #include <stdarg.h>
 #include <time.h>
 
-#include "page.h"
+static const char PAGE_TEMPLATE[] =
+	"<!DOCTYPE html>\n"
+	"<html lang='zh-CN'>\n"
+	"<head>\n"
+	"<meta charset='UTF-8'>\n"
+	"<meta name='viewport' content='width=device-width, initial-scale=1.0'>\n"
+	"<title>{{CLASS}}班点名</title>\n"
+	"<style>\n"
+	"* {\n"
+	"margin: 0;\n"
+	"padding: 0;\n"
+	"box-sizing: border-box;\n"
+	"}\n"
+	"body {\n"
+	"font-family: 'PingFang SC', 'Microsoft YaHei', 'Segoe UI', sans-serif;\n"
+	"background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);\n"
+	"overflow: hidden;\n"
+	"height: 100vh;\n"
+	"display: flex;\n"
+	"justify-content: center;\n"
+	"align-items: center;\n"
+	"position: relative;\n"
+	"}\n"
+	".main-container {\n"
+	"width: 100vw;\n"
+	"height: 100vh;\n"
+	"display: flex;\n"
+	"flex-direction: column;\n"
+	"justify-content: center;\n"
+	"align-items: center;\n"
+	"position: relative;\n"
+	"z-index: 1;\n"
+	"padding: 20px;\n"
+	"}\n"
+	".app-title {\n"
+	"font-size: 36px;\n"
+	"font-weight: 700;\n"
+	"color: #fff;\n"
+	"margin-bottom: 40px;\n"
+	"text-align: center;\n"
+	"letter-spacing: 2px;\n"
+	"text-shadow: 2px 2px 4px rgba(0,0,0,0.2);\n"
+	"}\n"
+	".app-title span {\n"
+	"color: #ffd93d;\n"
+	"}\n"
+	".name-card {\n"
+	"width: 80vw;\n"
+	"height: 30vh;\n"
+	"max-width: 800px;\n"
+	"min-height: 180px;\n"
+	"background-color: #ffffff;\n"
+	"border-radius: 25px;\n"
+	"box-shadow: 0 20px 40px rgba(0, 0, 0, 0.1);\n"
+	"display: flex;\n"
+	"justify-content: center;\n"
+	"align-items: center;\n"
+	"margin-bottom: 50px;\n"
+	"position: relative;\n"
+	"overflow: hidden;\n"
+	"transition: all 0.3s ease;\n"
+	"border: none;\n"
+	"}\n"
+	".name-card:hover {\n"
+	"transform: translateY(-5px);\n"
+	"box-shadow: 0 25px 50px rgba(0, 0, 0, 0.15);\n"
+	"}\n"
+	".name-card.bounce {\n"
+	"animation: bounce 0.5s cubic-bezier(0.68, -0.55, 0.265, 1.55);\n"
+	"}\n"
+	"@keyframes bounce {\n"
+	"0% { transform: scale(1); }\n"
+	"30% { transform: scale(1.01); }\n"
+	"50% { transform: scale(0.995); }\n"
+	"70% { transform: scale(1.005); }\n"
+	"100% { transform: scale(1); }\n"
+	"}\n"
+	".name-text {\n"
+	"font-size: 90px;\n"
+	"font-weight: 800;\n"
+	"text-align: center;\n"
+	"white-space: nowrap;\n"
+	"overflow: hidden;\n"
+	"text-overflow: ellipsis;\n"
+	"padding: 0 40px;\n"
+	"letter-spacing: 2px;\n"
+	"background: linear-gradient(\n"
+	"90deg,\n"
+	"#2c3e50 0%,\n"
+	"#2c3e50 25%,\n"
+	"#3498db 50%,\n"
+	"#e74c3c 75%,\n"
+	"#2c3e50 100%\n"
+	");\n"
+	"background-size: 200% auto;\n"
+	"-webkit-background-clip: text;\n"
+	"background-clip: text;\n"
+	"-webkit-text-fill-color: transparent;\n"
+	"animation: textShine 3s linear infinite;\n"
+	"}\n"
+	"@keyframes textShine {\n"
+	"0% { background-position: 0% center; }\n"
+	"100% { background-position: 200% center; }\n"
+	"}\n"
+	".roll-card {\n"
+	"background: white;\n"
+	"border-radius: 30px;\n"
+	"box-shadow: 0 20px 40px rgba(0, 0, 0, 0.1);\n"
+	"display: flex;\n"
+	"align-items: center;\n"
+	"justify-content: center;\n"
+	"padding: 0;\n"
+	"cursor: pointer;\n"
+	"user-select: none;\n"
+	"transition: all 0.3s ease;\n"
+	"border: none;\n"
+	"overflow: hidden;\n"
+	"position: relative;\n"
+	"}\n"
+	".roll-card:hover {\n"
+	"transform: translateY(-3px);\n"
+	"box-shadow: 0 25px 50px rgba(0, 0, 0, 0.15);\n"
+	"}\n"
+	".roll-card:active {\n"
+	"transform: translateY(1px);\n"
+	"box-shadow: 0 10px 20px rgba(0, 0, 0, 0.1);\n"
+	"}\n"
+	".roll-icon {\n"
+	"width: 30px;\n"
+	"height: 30px;\n"
+	"margin: 15px;\n"
+	"color: #3498db;\n"
+	"}\n"
+	".roll-text {\n"
+	"font-size: 20px;\n"
+	"color: #000000;\n"
+	"margin: 15px 15px 15px 0;\n"
+	"font-weight: 600;\n"
+	"}\n"
+	".settings-btn {\n"
+	"position: absolute;\n"
+	"top: 40px;\n"
+	"right: 40px;\n"
+	"width: 20px;\n"
+	"height: 20px;\n"
+	"cursor: pointer;\n"
+	"color: #7f8c8d;\n"
+	"transition: all 0.3s ease;\n"
+	"z-index: 10;\n"
+	"}\n"
+	".settings-btn:hover {\n"
+	"color: #3498db;\n"
+	"transform: scale(1.1);\n"
+	"}\n"
+	"@media (max-width: 1024px) {\n"
+	".name-card { width: 85vw; height: 28vh; }\n"
+	".name-text { font-size: 80px; }\n"
+	"}\n"
+	"@media (max-width: 768px) {\n"
+	".name-card { width: 90vw; height: 25vh; border-radius: 20px; }\n"
+	".name-text { font-size: 60px; padding: 0 20px; }\n"
+	".app-title { font-size: 28px; margin-bottom: 30px; }\n"
+	".roll-text { font-size: 18px; }\n"
+	"}\n"
+	"@media (max-width: 480px) {\n"
+	".name-card { width: 95vw; height: 22vh; border-radius: 15px; }\n"
+	".name-text { font-size: 48px; }\n"
+	".app-title { font-size: 24px; margin-bottom: 20px; }\n"
+	".roll-text { font-size: 16px; }\n"
+	".settings-btn { top: 20px; right: 20px; }\n"
+	"}\n"
+	"@media (max-height: 600px) {\n"
+	".name-card { height: 35vh; margin-bottom: 30px; }\n"
+	".name-text { font-size: 70px; }\n"
+	"}\n"
+	".toast {\n"
+	"position: fixed;\n"
+	"bottom: 30px;\n"
+	"left: 50%;\n"
+	"transform: translateX(-50%) translateY(100px);\n"
+	"background: rgba(44, 62, 80, 0.95);\n"
+	"color: white;\n"
+	"padding: 15px 30px;\n"
+	"border-radius: 25px;\n"
+	"font-size: 16px;\n"
+	"font-weight: 500;\n"
+	"opacity: 0;\n"
+	"transition: transform 0.3s, opacity 0.3s;\n"
+	"z-index: 1000;\n"
+	"box-shadow: 0 10px 25px rgba(0, 0, 0, 0.2);\n"
+	"backdrop-filter: blur(10px);\n"
+	"}\n"
+	".toast.show {\n"
+	"transform: translateX(-50%) translateY(0);\n"
+	"opacity: 1;\n"
+	"}\n"
+	".loading {\n"
+	"display: inline-block;\n"
+	"width: 20px;\n"
+	"height: 20px;\n"
+	"border: 3px solid rgba(52, 152, 219, 0.3);\n"
+	"border-radius: 50%;\n"
+	"border-top-color: #3498db;\n"
+	"animation: spin 1s ease-in-out infinite;\n"
+	"margin-right: 10px;\n"
+	"}\n"
+	"@keyframes spin {\n"
+	"to { transform: rotate(360deg); }\n"
+	"}\n"
+	".controls {\n"
+	"display: flex;\n"
+	"gap: 20px;\n"
+	"margin-top: 20px;\n"
+	"}\n"
+	".control-btn {\n"
+	"padding: 12px 30px;\n"
+	"font-size: 18px;\n"
+	"border: none;\n"
+	"border-radius: 12px;\n"
+	"background: #fff;\n"
+	"color: #333;\n"
+	"cursor: pointer;\n"
+	"transition: all 0.3s ease;\n"
+	"font-weight: 600;\n"
+	"box-shadow: 0 4px 15px rgba(0, 0, 0, 0.1);\n"
+	"}\n"
+	".control-btn:hover {\n"
+	"transform: translateY(-2px);\n"
+	"box-shadow: 0 6px 20px rgba(0, 0, 0, 0.15);\n"
+	"}\n"
+	".control-btn:active {\n"
+	"transform: translateY(1px);\n"
+	"}\n"
+	"#startStopBtn {\n"
+	"background: linear-gradient(135deg, #3498db, #2980b9);\n"
+	"color: white;\n"
+	"}\n"
+	"#resetBtn {\n"
+	"background: linear-gradient(135deg, #e74c3c, #c0392b);\n"
+	"color: white;\n"
+	"}\n"
+	".info-text {\n"
+	"color: rgba(255, 255, 255, 0.8);\n"
+	"margin-top: 20px;\n"
+	"font-size: 14px;\n"
+	"}\n"
+	"</style>\n"
+	"</head>\n"
+	"<body>\n"
+	"<div class='main-container'>\n"
+	"<span style='color: rgba(201, 208, 244, 1.0); text-align: center;'>version {{VERSION}}</span>\n"
+	"<h1 class='app-title'><span id='classNum'>{{CLASS}}</span>班点名</h1>\n"
+	"<div class='name-card' id='nameCard'>\n"
+	"<div class='name-text' id='currentName'>准备就绪</div>\n"
+	"</div>\n"
+	"<div class='controls'>\n"
+	"<button class='control-btn' id='startStopBtn'>开始点名</button>\n"
+	"<button class='control-btn' id='resetBtn'>重置名单</button>\n"
+	"</div>\n"
+	"<div class='info-text' id='remainText'>剩余 0 / 0 人</div>\n"
+	"<div style='color: rgba(255, 255, 255, 0.6); font-size: 14px; margin-top: 20px; text-align: center;'>\n"
+	"by 白异山\n"
+	"</div>\n"
+	"</div>\n"
+	"<div class='toast' id='toast'></div>\n"
+	"<script>\n"
+	"let originalStudents = {{STUDENTS}};\n"
+	"function rosterHash(list) {\n"
+	"let h = 5381;\n"
+	"const s = list.slice().sort().join('\\u0001');\n"
+	"for (let i = 0; i < s.length; i++) h = ((h * 33) ^ s.charCodeAt(i)) >>> 0;\n"
+	"return h.toString(36);\n"
+	"}\n"
+	"const STORAGE_KEY = 'dming.picked.v1.' + rosterHash(originalStudents);\n"
+	"const STATE_TTL_MS = {{STATE_TTL}};\n"
+	"const TTL_TEXT = STATE_TTL_MS >= 3600000 ? Math.round(STATE_TTL_MS / 3600000) + ' 小时' : Math.round(STATE_TTL_MS / 60000) + ' 分钟';\n"
+	"let stateExpired = false;\n"
+	"function loadState() {\n"
+	"try {\n"
+	"const raw = localStorage.getItem(STORAGE_KEY);\n"
+	"if (!raw) return null;\n"
+	"const st = JSON.parse(raw);\n"
+	"if (!st || !Array.isArray(st.picked) || typeof st.t !== 'number') return null;\n"
+	"if (Date.now() - st.t > STATE_TTL_MS) {\n"
+	"stateExpired = true;\n"
+	"localStorage.removeItem(STORAGE_KEY);\n"
+	"return null;\n"
+	"}\n"
+	"return st.picked;\n"
+	"} catch (e) { return null; }\n"
+	"}\n"
+	"let picked = new Set((loadState() || []).filter(function (n) { return originalStudents.indexOf(n) !== -1; }));\n"
+	"function savePicked() {\n"
+	"try { localStorage.setItem(STORAGE_KEY, JSON.stringify({ t: Date.now(), picked: Array.from(picked) })); } catch (e) {}\n"
+	"}\n"
+	"function touchTime() {\n"
+	"try {\n"
+	"const raw = localStorage.getItem(STORAGE_KEY);\n"
+	"const st = raw ? JSON.parse(raw) : null;\n"
+	"if (st && Array.isArray(st.picked)) {\n"
+	"st.t = Date.now();\n"
+	"localStorage.setItem(STORAGE_KEY, JSON.stringify(st));\n"
+	"} else if (picked.size > 0) {\n"
+	"savePicked();\n"
+	"}\n"
+	"} catch (e) {}\n"
+	"}\n"
+	"function syncFromStorage() {\n"
+	"if (!storageOk) return;\n"
+	"const latest = loadState();\n"
+	"if (latest === null) return;\n"
+	"picked = new Set(latest.filter(function (n) { return originalStudents.indexOf(n) !== -1; }));\n"
+	"students = shuffleArray(originalStudents.filter(function (n) { return !picked.has(n); }));\n"
+	"if (currentIndex >= students.length) currentIndex = 0;\n"
+	"updateRemain();\n"
+	"}\n"
+	"touchTime();\n"
+	"let students = originalStudents.filter(function (n) { return !picked.has(n); });\n"
+	"let storageOk = true;\n"
+	"try { localStorage.setItem('dming.probe', '1'); localStorage.removeItem('dming.probe'); } catch (e) { storageOk = false; }\n"
+	"let currentIndex = 0;\n"
+	"let isRolling = false;\n"
+	"let rollInterval = null;\n"
+	"let rollSpeed = 5;\n"
+	"const nameDisplay = document.getElementById('currentName');\n"
+	"const nameCard = document.getElementById('nameCard');\n"
+	"const startStopBtn = document.getElementById('startStopBtn');\n"
+	"const resetBtn = document.getElementById('resetBtn');\n"
+	"const remainText = document.getElementById('remainText');\n"
+	"function shuffleArray(array) {\n"
+	"for (let i = array.length - 1; i > 0; i--) {\n"
+	"const j = Math.floor(Math.random() * (i + 1));\n"
+	"[array[i], array[j]] = [array[j], array[i]];\n"
+	"}\n"
+	"return array;\n"
+	"}\n"
+	"function updateRemain() {\n"
+	"remainText.textContent = '剩余 ' + students.length + ' / ' + originalStudents.length + ' 人' + (picked.size > 0 ? '（已点 ' + picked.size + ' 人）' : '') + (storageOk ? '' : '｜浏览器不允许本地记录，重开页面会清零');\n"
+	"}\n"
+	"function resetStudents() {\n"
+	"if (isRolling) {\n"
+	"clearInterval(rollInterval);\n"
+	"isRolling = false;\n"
+	"startStopBtn.textContent = '开始点名';\n"
+	"startStopBtn.style.background = 'linear-gradient(135deg, #3498db, #2980b9)';\n"
+	"}\n"
+	"picked.clear();\n"
+	"savePicked();\n"
+	"students = shuffleArray([...originalStudents]);\n"
+	"currentIndex = 0;\n"
+	"nameDisplay.textContent = '准备就绪';\n"
+	"updateRemain();\n"
+	"}\n"
+	"function autoNewRound() {\n"
+	"picked.clear();\n"
+	"savePicked();\n"
+	"students = shuffleArray([...originalStudents]);\n"
+	"currentIndex = 0;\n"
+	"updateRemain();\n"
+	"}\n"
+	"function showToast(msg) {\n"
+	"const toast = document.getElementById('toast');\n"
+	"toast.textContent = msg;\n"
+	"toast.classList.add('show');\n"
+	"clearTimeout(showToast.timer);\n"
+	"showToast.timer = setTimeout(() => {\n"
+	"toast.classList.remove('show');\n"
+	"}, 1800);\n"
+	"}\n"
+	"students = shuffleArray([...students]);\n"
+	"updateRemain();\n"
+	"resetBtn.addEventListener('click', function() {\n"
+	"resetStudents();\n"
+	"showToast('名单已重置，共 ' + students.length + ' 人');\n"
+	"});\n"
+	"startStopBtn.addEventListener('click', function() {\n"
+	"touchTime();\n"
+	"if (isRolling) {\n"
+	"clearInterval(rollInterval);\n"
+	"startStopBtn.textContent = '开始点名';\n"
+	"startStopBtn.style.background = 'linear-gradient(135deg, #3498db, #2980b9)';\n"
+	"isRolling = false;\n"
+	"syncFromStorage();\n"
+	"if (students.length === 0 && originalStudents.length > 0) {\n"
+	"autoNewRound();\n"
+	"}\n"
+	"if (currentIndex >= students.length) currentIndex = 0;\n"
+	"const selectedName = students[currentIndex];\n"
+	"nameDisplay.textContent = selectedName;\n"
+	"nameCard.classList.add('bounce');\n"
+	"setTimeout(() => {\n"
+	"nameCard.classList.remove('bounce');\n"
+	"}, 300);\n"
+	"if (selectedName && students.length > 0) {\n"
+	"const indexToRemove = students.indexOf(selectedName);\n"
+	"if (indexToRemove !== -1) {\n"
+	"students.splice(indexToRemove, 1);\n"
+	"picked.add(selectedName);\n"
+	"savePicked();\n"
+	"if (students.length === 0) {\n"
+	"autoNewRound();\n"
+	"showToast('全部点完，名单已重置');\n"
+	"}\n"
+	"if (currentIndex >= students.length) {\n"
+	"currentIndex = 0;\n"
+	"}\n"
+	"}\n"
+	"updateRemain();\n"
+	"}\n"
+	"} else {\n"
+	"syncFromStorage();\n"
+	"if (originalStudents.length === 0) {\n"
+	"showToast('该名单无效，请重新获取');\n"
+	"return;\n"
+	"}\n"
+	"if (students.length === 0) {\n"
+	"autoNewRound();\n"
+	"}\n"
+	"currentIndex = 0;\n"
+	"startStopBtn.textContent = '停止点名';\n"
+	"startStopBtn.style.background = 'linear-gradient(135deg, #e74c3c, #c0392b)';\n"
+	"isRolling = true;\n"
+	"rollInterval = setInterval(() => {\n"
+	"if (students.length === 0) return;\n"
+	"nameDisplay.textContent = students[currentIndex];\n"
+	"currentIndex = (currentIndex + 1) % students.length;\n"
+	"}, rollSpeed);\n"
+	"}\n"
+	"});\n"
+	"window.addEventListener('storage', function (e) {\n"
+	"if (e.key !== STORAGE_KEY) return;\n"
+	"syncFromStorage();\n"
+	"});\n"
+	"window.addEventListener('load', function() {\n"
+	"updateRemain();\n"
+	"if (stateExpired) {\n"
+	"showToast('上次记录已过期（超过 ' + TTL_TEXT + '），已开新一轮');\n"
+	"} else if (originalStudents.length === 0) {\n"
+	"alert('该名单无效，请重新获取');\n"
+	"} else if (students.length === 0) {\n"
+	"autoNewRound();\n"
+	"showToast('全部点完，名单已重置');\n"
+	"} else if (picked.size > 0) {\n"
+	"showToast('已恢复上次进度：已点 ' + picked.size + ' 人');\n"
+	"}\n"
+	"});\n"
+	"setInterval(touchTime, 60000);\n"
+	"document.addEventListener('visibilitychange', function () { if (!document.hidden) { syncFromStorage(); touchTime(); } });\n"
+	"</script>\n"
+	"</body>\n"
+	"</html>\n"
+;
 
 #define APP_NAME    "dming"
-#define APP_VERSION "3.4.3"
+#define APP_VERSION "3.5.2"
 #define APP_DESC    "课堂随机点名器"
 
-/* 默认：开浏览器后等 3 秒再删临时文件 */
 #define DEFAULT_DELAY_MS 3000
-#define MAX_TEMP_TRIES   32
 
-/* ==========================================================================
- * 平台层
- *
- * Windows 上路径全部用 wchar_t（_wfopen / ShellExecuteW）：
- * fopen 走 ANSI 代码页，遇到中文用户名（C:\Users\张三\...）会直接失败。
- * 其他平台就是普通 char。
- * ========================================================================== */
+#define DEFAULT_STATE_TTL_MS (7 * 60 * 1000)
+#define MAX_TEMP_TRIES   32
 
 #ifdef _WIN32
 #  define WIN32_LEAN_AND_MEAN
 #  include <windows.h>
-#  include <shellapi.h>   /* ShellExecuteW —— 不在 windows.h 里，漏了会编译失败 */
-#  include <wchar.h>      /* wcslen / wcsrchr */
+#  include <shellapi.h>
+#  include <wchar.h>
 typedef wchar_t pchar;
 #  define PLIT_(s) L##s
 #  define PATH_SEP L'\\'
 #else
-#  include <sys/types.h>  /* pid_t / ssize_t，别指望 unistd.h 一定会带进来 */
+#  include <sys/types.h>
 #  include <unistd.h>
 #  include <sys/stat.h>
 #  include <sys/wait.h>
 #  include <errno.h>
 #  include <limits.h>
-#  ifdef __APPLE__
-#    include <mach-o/dyld.h>
-#  endif
 typedef char pchar;
 #  define PLIT_(s) s
 #  define PATH_SEP '/'
 #endif
 #define PLIT(s) PLIT_(s)
-
-/* ---------- 内存 ---------- */
 
 static void oom(void)
 {
@@ -118,8 +518,6 @@ static void *xrealloc(void *p, size_t n)
     return q;
 }
 
-/* ---------- pchar 小工具 ---------- */
-
 static size_t plen(const pchar *s)
 {
 #ifdef _WIN32
@@ -137,7 +535,6 @@ static pchar *pdup(const pchar *s)
     return r;
 }
 
-/* dir + 分隔符 + name；目录已带分隔符就不重复加 */
 static pchar *pjoin(const pchar *dir, const pchar *name)
 {
     size_t a = plen(dir), b = plen(name);
@@ -149,7 +546,6 @@ static pchar *pjoin(const pchar *dir, const pchar *name)
     return r;
 }
 
-/* pchar* -> UTF-8 的 char*，用于打印。caller 负责 free。 */
 static char *p_to_utf8(const pchar *s)
 {
 #ifdef _WIN32
@@ -165,7 +561,6 @@ static char *p_to_utf8(const pchar *s)
 #endif
 }
 
-/* 打印路径（自动转 UTF-8） */
 static void fprint_path(FILE *f, const pchar *p)
 {
     char *u = p_to_utf8(p);
@@ -176,8 +571,6 @@ static void fprint_path(FILE *f, const pchar *p)
         fputs("<路径无法显示>", f);
     }
 }
-
-/* ---------- 报错：命令行 + 图形弹窗（Windows 双击场景看不见控制台） ---------- */
 
 static void report_error(const char *fmt, ...)
 {
@@ -192,7 +585,7 @@ static void report_error(const char *fmt, ...)
     fputc('\n', stderr);
 #ifdef _WIN32
     {
-        /* buf 是 UTF-8，转成宽字符再弹窗 */
+
         int need = MultiByteToWideChar(CP_UTF8, 0, buf, -1, NULL, 0);
         if (need > 0) {
             wchar_t *w = xmalloc((size_t)need * sizeof(wchar_t));
@@ -204,36 +597,27 @@ static void report_error(const char *fmt, ...)
 #endif
 }
 
-/* ---------- 可执行文件所在目录 ---------- */
-
 #ifndef _WIN32
-/* 把 "/a/b/c" 就地截成 "/a/b"。成功返回 0。 */
+
 static int strip_last_segment(char *p)
 {
     char *s = strrchr(p, '/');
     if (!s)
         return -1;
     if (s == p)
-        s[1] = '\0';    /* 根目录，保留开头的 '/' */
+        s[1] = '\0';
     else
         *s = '\0';
     return 0;
 }
 
-/*
- * 从 argv[0] 推目录。这是 Termux/Android 上的主要途径：
- * termux-exec 为了绕开 SELinux 对私有目录的执行限制，会把所有程序交给
- * /system/bin/linker64 启动，于是 /proc/self/exe 指向的是 linker 而不是本程序。
- * 但它在转交时会把 argv[0] 规范化成程序的绝对路径（相对路径和 PATH 调用都一样），
- * 所以这里反而更可靠。
- */
 static pchar *dir_from_argv0(const char *a0)
 {
     if (!a0 || !*a0)
         return NULL;
 
     if (strchr(a0, '/')) {
-        /* 带路径（可能是相对的），按当前目录展开 */
+
         char real[PATH_MAX];
         if (!realpath(a0, real))
             return NULL;
@@ -242,7 +626,6 @@ static pchar *dir_from_argv0(const char *a0)
         return pdup(real);
     }
 
-    /* 裸文件名：在 PATH 里找 */
     {
         const char *path = getenv("PATH");
         const char *p = path;
@@ -276,7 +659,6 @@ static pchar *exe_dir(const char *argv0)
     DWORD n;
     wchar_t *s;
 
-    /* GetModuleFileNameW 在 Windows 上足够可靠，不用 argv[0] 兜底 */
     (void)argv0;
 
     n = GetModuleFileNameW(NULL, buf, (DWORD)(sizeof buf / sizeof buf[0]));
@@ -287,21 +669,6 @@ static pchar *exe_dir(const char *argv0)
         return NULL;
     *s = L'\0';
     return pdup(buf);
-#elif defined(__APPLE__)
-    {
-        char buf[PATH_MAX];
-        uint32_t sz = (uint32_t)sizeof buf;
-        if (_NSGetExecutablePath(buf, &sz) != 0)
-            return dir_from_argv0(argv0);
-        {
-            char real[PATH_MAX];
-            if (!realpath(buf, real))
-                return dir_from_argv0(argv0);
-            if (strip_last_segment(real) != 0)
-                return NULL;
-            return pdup(real);
-        }
-    }
 #else
     {
         char buf[4096];
@@ -311,10 +678,7 @@ static pchar *exe_dir(const char *argv0)
             buf[n] = '\0';
             base = strrchr(buf, '/');
             base = base ? base + 1 : buf;
-            /*
-             * Termux/Android 上 /proc/self/exe 指向 linker 本身，不是本程序，
-             * 必须排掉，否则会在 /apex/com.android.runtime/bin 下面找 p.txt。
-             */
+
             if (strcmp(base, "linker64") != 0 && strcmp(base, "linker") != 0 &&
                 access(buf, F_OK) == 0) {
                 char real[PATH_MAX];
@@ -327,8 +691,6 @@ static pchar *exe_dir(const char *argv0)
 #endif
 }
 
-/* ---------- 系统临时目录（程序目录不可写时的退路） ---------- */
-
 static pchar *temp_dir(void)
 {
 #ifdef _WIN32
@@ -336,7 +698,7 @@ static pchar *temp_dir(void)
     DWORD n = GetTempPathW((DWORD)(sizeof buf / sizeof buf[0]), buf);
     if (n == 0 || n > (DWORD)(sizeof buf / sizeof buf[0]))
         return NULL;
-    /* GetTempPathW 通常带结尾反斜杠，去掉以免 pjoin 再加一个 */
+
     while (n > 1 && (buf[n - 1] == L'\\' || buf[n - 1] == L'/'))
         buf[--n] = L'\0';
     return pdup(buf);
@@ -347,8 +709,6 @@ static pchar *temp_dir(void)
     return pdup(t);
 #endif
 }
-
-/* ---------- 文件操作 ---------- */
 
 static FILE *p_fopen_read(const pchar *path)
 {
@@ -387,7 +747,6 @@ static int p_exists(const pchar *path)
     return 0;
 }
 
-/* 读整个文件，返回 NUL 结尾的缓冲区；失败返回 NULL */
 static char *read_file(const pchar *path, size_t *out_len)
 {
     FILE *f = p_fopen_read(path);
@@ -415,10 +774,6 @@ static char *read_file(const pchar *path, size_t *out_len)
         *out_len = len;
     return buf;
 }
-
-/* ==========================================================================
- * 动态字符串缓冲
- * ========================================================================== */
 
 typedef struct {
     char *p;
@@ -469,10 +824,6 @@ static void buf_free(Buf *b)
     b->len = b->cap = 0;
 }
 
-/* ==========================================================================
- * 姓名列表
- * ========================================================================== */
-
 typedef struct {
     char **v;
     size_t n, cap;
@@ -490,15 +841,12 @@ static void names_add(Names *ns, const char *s, size_t len)
     ns->n++;
 }
 
-/* ---------- 文本按行拆 ---------- */
-
 static int is_blank(unsigned char c)
 {
     return c == ' ' || c == '\t' || c == '\r' || c == '\n' ||
            c == '\v' || c == '\f';
 }
 
-/* 去掉首尾空白（就地截断尾部），返回新的起点 */
 static char *trim(char *s)
 {
     char *e;
@@ -510,10 +858,6 @@ static char *trim(char *s)
     return s;
 }
 
-/*
- * 按行拆开、逐行 trim、跳过空行，每行回调一次。
- * 兼容 CRLF；开头的 UTF-8 BOM 会被剥掉。返回非空行数。
- */
 static size_t split_lines(char *text, void (*add)(void *, const char *, size_t),
                           void *ud)
 {
@@ -546,7 +890,6 @@ static void add_name_cb(void *ud, const char *s, size_t len)
     names_add((Names *)ud, s, len);
 }
 
-/* class.txt 只取第一个非空行 */
 typedef struct {
     char *value;
 } FirstLine;
@@ -561,18 +904,6 @@ static void add_first_cb(void *ud, const char *s, size_t len)
     }
 }
 
-/* ==========================================================================
- * 转义
- * ========================================================================== */
-
-/*
- * 注入 JS 数组用：转义 " \ 和 < > &，UTF-8 原样透传。
- *
- * < > & 并不是 JSON 语法要求的，但这段 JSON 是嵌在 HTML 的 <script> 里的：
- * 姓名要是含 "</script>"（或者 "<script>"），就会冲出脚本块变成 HTML，
- * 轻则页面崩掉，重则被当成注入。转成 \u003c 之后 JS 解析出来还是原字符，
- * 显示完全一样，但不可能再冲出标签。这是「JSON 嵌 HTML」的标准做法。
- */
 static void json_escape(Buf *out, const char *s)
 {
     const unsigned char *p = (const unsigned char *)s;
@@ -598,7 +929,6 @@ static void json_escape(Buf *out, const char *s)
     }
 }
 
-/* 放进 HTML 文本节点/标题里用 */
 static void html_escape(Buf *out, const char *s)
 {
     for (; *s; s++) {
@@ -611,10 +941,6 @@ static void html_escape(Buf *out, const char *s)
         }
     }
 }
-
-/* ==========================================================================
- * 模板渲染：把 {{KEY}} 换成 value
- * ========================================================================== */
 
 static void render(Buf *out, const char *tpl, const char *key, const char *value)
 {
@@ -632,15 +958,11 @@ static void render(Buf *out, const char *tpl, const char *key, const char *value
     }
 }
 
-/* ==========================================================================
- * 打开浏览器
- * ========================================================================== */
-
 #ifdef _WIN32
 static int open_browser(const pchar *path)
 {
     HINSTANCE r = ShellExecuteW(NULL, L"open", path, NULL, NULL, SW_SHOWNORMAL);
-    return ((INT_PTR)r > 32) ? 0 : -1;   /* >32 才是成功 */
+    return ((INT_PTR)r > 32) ? 0 : -1;
 }
 #else
 static int try_exec(char *const argv[])
@@ -653,10 +975,9 @@ static int try_exec(char *const argv[])
         return -1;
     if (pid == 0) {
         execvp(argv[0], argv);
-        _exit(127);          /* 127 = 找不到命令 */
+        _exit(127);
     }
 
-    /* waitpid 可能被信号打断（EINTR），那不是失败，要接着等 */
     do {
         w = waitpid(pid, &status, 0);
     } while (w < 0 && errno == EINTR);
@@ -670,7 +991,7 @@ static int try_exec(char *const argv[])
 
 static int open_browser(const pchar *path)
 {
-    char *p = (char *)path;   /* 非 Windows 下 pchar 就是 char */
+    char *p = (char *)path;
     static const char *cands[] = {
         "xdg-open", "termux-open", "gio", "sensible-browser",
         "x-www-browser", "wslview", NULL
@@ -695,10 +1016,6 @@ static int open_browser(const pchar *path)
 }
 #endif
 
-/* ==========================================================================
- * 延时（被信号打断就提前返回）
- * ========================================================================== */
-
 static void sleep_ms(int ms)
 {
     if (ms <= 0)
@@ -711,20 +1028,17 @@ static void sleep_ms(int ms)
         ts.tv_sec = ms / 1000;
         ts.tv_nsec = (long)(ms % 1000) * 1000000L;
         if (nanosleep(&ts, &ts) == -1 && errno == EINTR)
-            return;          /* Ctrl+C：不继续等了 */
+            return;
     }
 #endif
 }
-
-/* ==========================================================================
- * 命令行
- * ========================================================================== */
 
 typedef struct {
     int keep;
     int no_open;
     int quiet;
     int delay_ms;
+    int state_ttl_ms;
 } Options;
 
 static void usage(FILE *out, const char *argv0)
@@ -743,18 +1057,13 @@ static void usage(FILE *out, const char *argv0)
         "  -keep            保留生成的临时 HTML 文件，不自动删除\n"
         "  -no-open         只生成 HTML，不自动打开浏览器\n"
         "  -delay <时间>    浏览器打开后等多久再删（默认 3s；可写 800ms / 8s / 8）\n"
+        "  -state-ttl <时间> 上次点名记录的有效期（默认 7m；可写 45m / 90m / 7200s）\n"
         "  -quiet           安静模式，只输出临时文件路径\n"
         "  -h, --help       显示本帮助\n"
         "  -v, --version    显示版本\n",
         APP_NAME, APP_VERSION, APP_DESC, argv0);
 }
 
-/*
- * "8s" / "800ms" / "8"（裸数字按秒）。
- *
- * 上限 24 小时：strtol 溢出时会返回 LONG_MAX，后面再乘 1000 就是有符号溢出
- * （未定义行为）。所以必须在乘法【之前】卡住，不能先算再判断。
- */
 static int parse_delay(const char *s, int *out_ms)
 {
     char *end = NULL;
@@ -772,6 +1081,14 @@ static int parse_delay(const char *s, int *out_ms)
         if (v > 86400000L)
             return -1;
         ms = v;
+    } else if (strcmp(end, "m") == 0) {
+        if (v > 1440L)
+            return -1;
+        ms = v * 60L * 1000L;
+    } else if (strcmp(end, "h") == 0) {
+        if (v > 24L)
+            return -1;
+        ms = v * 3600L * 1000L;
     } else {
         return -1;
     }
@@ -780,16 +1097,15 @@ static int parse_delay(const char *s, int *out_ms)
     return 0;
 }
 
-/* ==========================================================================
- * main
- * ========================================================================== */
-
-/* 生成 "DMING<random>.html" 的完整路径 */
 static pchar *make_temp_path(const pchar *dir, int attempt)
 {
-    long r = (long)((time(NULL) * 1000 + attempt * 7919) % 100000000L);
     char name[64];
-    snprintf(name, sizeof name, "DMING%ld.html", r);
+    if (attempt == 0) {
+        snprintf(name, sizeof name, "DMING.html");
+    } else {
+        long r = (long)((time(NULL) * 1000 + attempt * 7919) % 100000000L);
+        snprintf(name, sizeof name, "DMING%ld.html", r);
+    }
 #ifdef _WIN32
     {
         wchar_t wname[64];
@@ -803,21 +1119,21 @@ static pchar *make_temp_path(const pchar *dir, int attempt)
 #endif
 }
 
-/* 在 dir 下写页面，成功返回路径，失败返回 NULL */
 static pchar *write_page(const pchar *dir, const char *data, size_t len)
 {
     int attempt;
     for (attempt = 0; attempt < MAX_TEMP_TRIES; attempt++) {
         pchar *path = make_temp_path(dir, attempt);
         FILE *f;
-        if (p_exists(path)) {
+
+        if (attempt > 0 && p_exists(path)) {
             free(path);
             continue;
         }
         f = p_fopen_write(path);
         if (!f) {
             free(path);
-            return NULL;      /* 目录不可写，别重试了 */
+            return NULL;
         }
         if (fwrite(data, 1, len, f) != len) {
             fclose(f);
@@ -843,7 +1159,7 @@ int main(int argc, char **argv)
     int i;
 
 #ifdef _WIN32
-    /* 让控制台按 UTF-8 显示中文（配合源码里的 UTF-8 字面量） */
+
     SetConsoleOutputCP(CP_UTF8);
 #endif
 
@@ -851,6 +1167,7 @@ int main(int argc, char **argv)
     opt.no_open = 0;
     opt.quiet = 0;
     opt.delay_ms = DEFAULT_DELAY_MS;
+    opt.state_ttl_ms = DEFAULT_STATE_TTL_MS;
 
     for (i = 1; i < argc; i++) {
         const char *a = argv[i];
@@ -860,6 +1177,15 @@ int main(int argc, char **argv)
             opt.no_open = 1;
         } else if (strcmp(a, "-quiet") == 0 || strcmp(a, "--quiet") == 0) {
             opt.quiet = 1;
+        } else if (strcmp(a, "-state-ttl") == 0 || strcmp(a, "--state-ttl") == 0) {
+            if (i + 1 >= argc) {
+                fputs("错误：-state-ttl 后面要跟一个时间，例如 45m 或 2h\n", stderr);
+                return 2;
+            }
+            if (parse_delay(argv[++i], &opt.state_ttl_ms) != 0) {
+                fputs("错误：-state-ttl 的时间格式不对（例如 45m / 90m / 2h）\n", stderr);
+                return 2;
+            }
         } else if (strcmp(a, "-delay") == 0 || strcmp(a, "--delay") == 0) {
             if (i + 1 >= argc) {
                 fputs("错误：-delay 后面要跟一个时间，例如 8s 或 800ms\n", stderr);
@@ -882,7 +1208,6 @@ int main(int argc, char **argv)
         }
     }
 
-    /* ---- 数据目录 = 可执行文件所在目录 ---- */
     dir = exe_dir(argv0);
     if (!dir) {
         report_error("无法确定程序所在目录");
@@ -892,7 +1217,6 @@ int main(int argc, char **argv)
     list_path = pjoin(dir, PLIT("p.txt"));
     class_path = pjoin(dir, PLIT("class.txt"));
 
-    /* ---- 名单 ---- */
     list_text = read_file(list_path, NULL);
     if (!list_text) {
         char *u = p_to_utf8(list_path);
@@ -908,7 +1232,6 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    /* ---- 班级 ---- */
     class_text = read_file(class_path, NULL);
     if (!class_text) {
         char *u = p_to_utf8(class_path);
@@ -934,7 +1257,6 @@ int main(int argc, char **argv)
         printf("班级：%s\n", fl.value);
     }
 
-    /* ---- 渲染 ---- */
     buf_init(&students);
     buf_putc(&students, '[');
     for (i = 0; i < (int)names.n; i++) {
@@ -955,16 +1277,21 @@ int main(int argc, char **argv)
         buf_init(&t1);
         render(&t1, PAGE_TEMPLATE, "{{CLASS}}", cls.p);
         buf_init(&t2);
+        Buf t3;
+        char ttl[32];
         render(&t2, t1.p, "{{VERSION}}", APP_VERSION);
-        render(&page, t2.p, "{{STUDENTS}}", students.p);
+        snprintf(ttl, sizeof ttl, "%d", opt.state_ttl_ms);
+        buf_init(&t3);
+        render(&t3, t2.p, "{{STATE_TTL}}", ttl);
+        render(&page, t3.p, "{{STUDENTS}}", students.p);
         buf_free(&t1);
         buf_free(&t2);
+        buf_free(&t3);
     }
 
     if (!opt.quiet)
         printf("正在生成临时页面...\n");
 
-    /* ---- 写临时页：先试程序目录，不行退到系统临时目录 ---- */
     page_path = write_page(dir, page.p, page.len);
     if (!page_path) {
         pchar *td = temp_dir();
