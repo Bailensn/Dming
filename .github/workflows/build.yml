@@ -44,7 +44,7 @@ jobs:
             echo "=== windows/$arch ==="
             "$rc" dming.rc -O coff -o dming_res.o
             "$cc" $WFLAGS -o "dist/dming-windows-$arch.exe" \
-              dming.c dming_res.o -lshell32 -luser32
+              dming.c dming_res.o -lshell32 -luser32 -lws2_32
           }
           build 386   i686-w64-mingw32-gcc   i686-w64-mingw32-windres
           build amd64 x86_64-w64-mingw32-gcc x86_64-w64-mingw32-windres
@@ -74,7 +74,7 @@ jobs:
           fi
 
           echo "=== windows/arm64 ==="
-          "$CC_A" $WFLAGS -o dist/dming-windows-arm64.exe dming.c $RES -lshell32 -luser32
+          "$CC_A" $WFLAGS -o dist/dming-windows-arm64.exe dming.c $RES -lshell32 -luser32 -lws2_32
 
       - name: 校验版本号两处一致
         run: |
@@ -173,15 +173,30 @@ jobs:
           printf 'Alice\nBob\n\n  Carol  \n张三\r\n' > "$T/p.txt"
           printf '14\n' > "$T/class.txt"
 
-          ( cd / && "$T/dming" -no-open )
+          # 3.6 起 -no-open 是「起本地服务但不打开浏览器」，会一直跑，所以放后台
+          "$T/dming" -no-open -quiet -port 47811 -heartbeat 30s > "$T/url.txt" 2>&1 &
+          PID=$!
+          trap 'kill "$PID" 2>/dev/null || true' EXIT
 
-          page="$(ls "$T"/DMING*.html)"
-          echo "生成的页面: $page"
-          grep -q '<title>14班点名</title>' "$page"
+          for i in $(seq 1 60); do
+            [ -s "$T/url.txt" ] && break
+            sleep 0.2
+          done
+          URL="$(head -n 1 "$T/url.txt")"
+          echo "服务地址: $URL"
+          test -n "$URL"
+
+          curl -fsS "$URL" -o "$T/page.html"
+          grep -q '<title>14班点名</title>' "$T/page.html"
           V="$(sed -n 's/^#define APP_VERSION "\([0-9.]*\)".*/\1/p' dming.c)"
-          grep -q "version $V" "$page"
-          grep -q 'let originalStudents = \["Alice","Bob","Carol","张三"\]' "$page"
-          echo "OK: 页面内容正确"
+          grep -q "version $V" "$T/page.html"
+          grep -q 'let originalStudents = \["Alice","Bob","Carol","张三"\]' "$T/page.html"
+
+          test "$(curl -s -o /dev/null -w '%{http_code}' "${URL}__ping")" = "204"
+
+          kill "$PID"
+          wait "$PID" 2>/dev/null || true
+          echo "OK: 页面内容正确，/__ping 返回 204"
 
       - uses: actions/upload-artifact@v7
         with:

@@ -12,6 +12,11 @@ BIN="$OUT/dming-$TARGET$EXT"
 
 CFLAGS="${CFLAGS:--std=gnu99 -O2 -Wall -Wextra}"
 
+LIBS="${LIBS:-}"
+case "$TARGET" in
+	*mingw*|*windows*|*msys*|*cygwin*) LIBS="$LIBS -lws2_32" ;;
+esac
+
 mkdir -p "$OUT"
 
 RES=""
@@ -24,7 +29,7 @@ elif [ -n "$RC" ]; then
 fi
 
 echo "=== 编译 $TARGET ==="
-$CC $CFLAGS -o "$BIN" dming.c $RES
+$CC $CFLAGS -o "$BIN" dming.c $RES $LIBS
 
 echo
 echo "完成: $BIN"

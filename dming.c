@@ -457,23 +457,51 @@ static const char PAGE_TEMPLATE[] =
 	"}\n"
 	"});\n"
 	"setInterval(touchTime, 60000);\n"
-	"document.addEventListener('visibilitychange', function () { if (!document.hidden) { syncFromStorage(); touchTime(); } });\n"
+	"let pingFailed = false;\n"
+	"function pingServer() {\n"
+	"if (location.protocol !== 'http:') return;\n"
+	"fetch('/__ping', { cache: 'no-store' }).then(function (r) {\n"
+	"if (!r.ok) throw new Error('bad status');\n"
+	"pingFailed = false;\n"
+	"}).catch(function () {\n"
+	"if (pingFailed) return;\n"
+	"pingFailed = true;\n"
+	"showToast('本地服务已停止，刷新页面需要重新运行 dming');\n"
+	"});\n"
+	"}\n"
+	"pingServer();\n"
+	"setInterval(pingServer, 30000);\n"
+	"document.addEventListener('visibilitychange', function () {\n"
+	"if (document.hidden) return;\n"
+	"syncFromStorage();\n"
+	"touchTime();\n"
+	"pingServer();\n"
+	"});\n"
 	"</script>\n"
 	"</body>\n"
 	"</html>\n"
 ;
 
 #define APP_NAME    "dming"
-#define APP_VERSION "3.5.2"
+#define APP_VERSION "4.1.3"
 #define APP_DESC    "课堂随机点名器"
-
-#define DEFAULT_DELAY_MS 3000
 
 #define DEFAULT_STATE_TTL_MS (7 * 60 * 1000)
 #define MAX_TEMP_TRIES   32
 
+/* 页面通过 http://127.0.0.1:<端口>/ 提供。localStorage 按 origin 隔离，
+ * 所以「端口固定」是点名进度不丢的前提：端口一变 origin 就变，等于换了台机器。
+ * 只在 loopback 上监听，不触达局域网，也不会弹防火墙授权。 */
+#define DEFAULT_PORT      47123
+#define DEFAULT_BEAT_MS   (5 * 60 * 1000)
+#define CONN_RCV_TIMEOUT  200
+#define CONN_SND_TIMEOUT  5000
+#define MAX_REQ_BYTES     8192
+
 #ifdef _WIN32
 #  define WIN32_LEAN_AND_MEAN
+#  include <winsock2.h>
+#  include <ws2tcpip.h>
 #  include <windows.h>
 #  include <shellapi.h>
 #  include <wchar.h>
@@ -485,6 +513,10 @@ typedef wchar_t pchar;
 #  include <unistd.h>
 #  include <sys/stat.h>
 #  include <sys/wait.h>
+#  include <sys/socket.h>
+#  include <netinet/in.h>
+#  include <arpa/inet.h>
+#  include <signal.h>
 #  include <errno.h>
 #  include <limits.h>
 typedef char pchar;
@@ -1016,28 +1048,381 @@ static int open_browser(const pchar *path)
 }
 #endif
 
-static void sleep_ms(int ms)
-{
-    if (ms <= 0)
-        return;
+/* ------------------------------------------------------------------ *
+ * 本地页面服务（只监听 127.0.0.1）
+ *
+ * 为什么值得用 socket 换掉 file://：页面里的点名进度存在 localStorage，
+ * 而 localStorage 按 origin 隔离。file:// 下各浏览器行为不一致（有的把每个
+ * 文件当独立 origin，有的干脆禁用），http origin 才是所有内核都认的稳定身份。
+ * 代价是端口必须固定，见 DEFAULT_PORT。
+ * ------------------------------------------------------------------ */
+
 #ifdef _WIN32
-    Sleep((DWORD)ms);
+typedef SOCKET sock_t;
+#  define SOCK_BAD  INVALID_SOCKET
+#  define sock_close closesocket
+/* 老 SDK / Win9x 目标下 winsock2.h 可能不给这个宏，缺了就用官方等价定义 */
+#  ifndef SO_EXCLUSIVEADDRUSE
+#    define SO_EXCLUSIVEADDRUSE ((int)(~SO_REUSEADDR))
+#  endif
 #else
-    {
-        struct timespec ts;
-        ts.tv_sec = ms / 1000;
-        ts.tv_nsec = (long)(ms % 1000) * 1000000L;
-        if (nanosleep(&ts, &ts) == -1 && errno == EINTR)
-            return;
-    }
+typedef int sock_t;
+#  define SOCK_BAD  (-1)
+#  define sock_close close
+#endif
+
+static int net_global_init(void)
+{
+#ifdef _WIN32
+    WSADATA w;
+    return WSAStartup(MAKEWORD(2, 2), &w) == 0 ? 0 : -1;
+#else
+    /* 浏览器中途关闭连接时不能让进程被 SIGPIPE 打死 */
+    signal(SIGPIPE, SIG_IGN);
+    return 0;
 #endif
 }
 
+static void net_global_fini(void)
+{
+#ifdef _WIN32
+    WSACleanup();
+#endif
+}
+
+static pchar *p_from_ascii(const char *s)
+{
+#ifdef _WIN32
+    size_t n = strlen(s), i;
+    wchar_t *w = (wchar_t *)xmalloc((n + 1) * sizeof(wchar_t));
+    for (i = 0; i < n; i++)
+        w[i] = (wchar_t)(unsigned char)s[i];
+    w[n] = 0;
+    return w;
+#else
+    return pdup(s);
+#endif
+}
+
+static void sock_timeout(sock_t s)
+{
+#ifdef _WIN32
+    DWORD rcv = CONN_RCV_TIMEOUT, snd = CONN_SND_TIMEOUT;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&rcv, sizeof rcv);
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char *)&snd, sizeof snd);
+#else
+    struct timeval tv;
+    tv.tv_sec = CONN_RCV_TIMEOUT / 1000;
+    tv.tv_usec = (long)(CONN_RCV_TIMEOUT % 1000) * 1000L;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    tv.tv_sec = CONN_SND_TIMEOUT / 1000;
+    tv.tv_usec = (long)(CONN_SND_TIMEOUT % 1000) * 1000L;
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+#endif
+}
+
+static int send_all(sock_t s, const char *buf, size_t len)
+{
+    while (len > 0) {
+        int chunk = (len > 65536) ? 65536 : (int)len;
+        int n = send(s, buf, chunk, 0);
+        if (n <= 0)
+            return -1;
+        buf += n;
+        len -= (size_t)n;
+    }
+    return 0;
+}
+
+static int http_reply(sock_t s, int code, const char *reason,
+                      const char *ctype, const char *body, size_t blen,
+                      int head_only)
+{
+    char head[384];
+    int hl = snprintf(head, sizeof head,
+                      "HTTP/1.1 %d %s\r\n"
+                      "Content-Type: %s\r\n"
+                      "Content-Length: %lu\r\n"
+                      "Cache-Control: no-store\r\n"
+                      "Connection: close\r\n"
+                      "\r\n",
+                      code, reason, ctype, (unsigned long)blen);
+
+    if (hl <= 0 || (size_t)hl >= sizeof head)
+        return -1;
+    if (send_all(s, head, (size_t)hl) != 0)
+        return -1;
+    if (!head_only && body && blen > 0 && send_all(s, body, blen) != 0)
+        return -1;
+    return 0;
+}
+
+static void serve_page(sock_t c, const pchar *page_path, int head_only)
+{
+    size_t len = 0;
+    char *body = read_file(page_path, &len);
+
+    if (!body) {
+        static const char msg[] = "页面文件读不到，请重新运行 dming\n";
+        http_reply(c, 500, "Internal Server Error", "text/plain; charset=utf-8",
+                   msg, sizeof msg - 1, head_only);
+        return;
+    }
+    /* 不加 Access-Control-Allow-Origin：别的站点就算能发请求也读不到响应 */
+    http_reply(c, 200, "OK", "text/html; charset=utf-8", body, len, head_only);
+    free(body);
+}
+
+static void serve_whoami(sock_t c, const pchar *page_path, int head_only)
+{
+    char *u = p_to_utf8(page_path);
+    if (!u) {
+        http_reply(c, 500, "Internal Server Error", "text/plain; charset=utf-8",
+                   "?", 1, head_only);
+        return;
+    }
+    http_reply(c, 200, "OK", "text/plain; charset=utf-8", u, strlen(u),
+               head_only);
+    free(u);
+}
+
+static void handle_conn(sock_t c, const pchar *page_path)
+{
+    char req[MAX_REQ_BYTES];
+    char method[8], target[512];
+    size_t got = 0;
+    char *q;
+    int head;
+
+    for (;;) {
+        int n;
+        if (got + 1 >= sizeof req)
+            break;
+        n = recv(c, req + got, (int)(sizeof req - 1 - got), 0);
+        if (n <= 0)
+            break;              /* 超时或对端已关，就用已经收到的部分 */
+        got += (size_t)n;
+        req[got] = '\0';
+        if (strstr(req, "\r\n\r\n") || strstr(req, "\n\n"))
+            break;
+    }
+    req[got] = '\0';
+    if (got == 0)
+        return;                 /* 浏览器的预连接，什么都不发 */
+
+    method[0] = target[0] = '\0';
+    if (sscanf(req, "%7s %511s", method, target) != 2)
+        return;
+
+    q = strchr(target, '?');
+    if (q)
+        *q = '\0';
+
+    if (strcmp(method, "GET") != 0 && strcmp(method, "HEAD") != 0) {
+        http_reply(c, 405, "Method Not Allowed", "text/plain; charset=utf-8",
+                   "GET only\n", 9, 0);
+        return;
+    }
+    head = (strcmp(method, "HEAD") == 0);
+    if (strcmp(target, "/favicon.ico") == 0) {
+        http_reply(c, 204, "No Content", "text/plain; charset=utf-8", NULL, 0,
+                   0);
+        return;
+    }
+    if (strcmp(target, "/__ping") == 0) {
+        /* 页面每 30s 打一次；只要请求进来就算「页面还在」 */
+        http_reply(c, 204, "No Content", "text/plain; charset=utf-8", NULL, 0,
+                   0);
+        return;
+    }
+    if (strcmp(target, "/__whoami") == 0) {
+        serve_whoami(c, page_path, head);
+        return;
+    }
+    if (strcmp(target, "/") == 0 || strcmp(target, "/index.html") == 0) {
+        serve_page(c, page_path, head);
+        return;
+    }
+    http_reply(c, 404, "Not Found", "text/plain; charset=utf-8", "not found\n",
+               10, 0);
+}
+
+static sock_t listen_loopback(int port)
+{
+    sock_t s;
+    struct sockaddr_in a;
+    int one = 1;
+
+    s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s == SOCK_BAD)
+        return SOCK_BAD;
+
+#ifdef _WIN32
+    /* Windows 上 SO_REUSEADDR 会允许两个进程抢同一个端口，反而破坏复用检测 */
+    setsockopt(s, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, (const char *)&one, sizeof one);
+#else
+    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+#endif
+
+    memset(&a, 0, sizeof a);
+    a.sin_family = AF_INET;
+    a.sin_port = htons((unsigned short)port);
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+    if (bind(s, (struct sockaddr *)&a, sizeof a) != 0 || listen(s, 16) != 0) {
+        sock_close(s);
+        return SOCK_BAD;
+    }
+    return s;
+}
+
+/* 端口上是不是有个活着的 dming？只做一次 connect 探测。 */
+static int probe_local(int port)
+{
+    sock_t s;
+    struct sockaddr_in a;
+    int ok;
+
+    s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s == SOCK_BAD)
+        return 0;
+    memset(&a, 0, sizeof a);
+    a.sin_family = AF_INET;
+    a.sin_port = htons((unsigned short)port);
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    ok = (connect(s, (struct sockaddr *)&a, sizeof a) == 0);
+    sock_close(s);
+    return ok;
+}
+
+static char *http_get_local(int port, const char *path, size_t *out_len)
+{
+    sock_t s;
+    struct sockaddr_in a;
+    char req[256];
+    char *buf = NULL;
+    size_t cap = 0, len = 0;
+    char *hdr;
+    int rl;
+
+    s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s == SOCK_BAD)
+        return NULL;
+    memset(&a, 0, sizeof a);
+    a.sin_family = AF_INET;
+    a.sin_port = htons((unsigned short)port);
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (connect(s, (struct sockaddr *)&a, sizeof a) != 0) {
+        sock_close(s);
+        return NULL;
+    }
+    sock_timeout(s);
+
+    rl = snprintf(req, sizeof req,
+                  "GET %s HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+                  path);
+    if (rl <= 0 || send_all(s, req, (size_t)rl) != 0) {
+        sock_close(s);
+        return NULL;
+    }
+
+    for (;;) {
+        char tmp[1024];
+        int n = recv(s, tmp, (int)sizeof tmp, 0);
+        if (n <= 0)
+            break;
+        if (len + (size_t)n + 1 > cap) {
+            cap = (len + (size_t)n + 1) * 2;
+            buf = xrealloc(buf, cap);
+        }
+        memcpy(buf + len, tmp, (size_t)n);
+        len += (size_t)n;
+    }
+    sock_close(s);
+
+    if (!buf || len == 0) {
+        free(buf);
+        return NULL;
+    }
+    buf[len] = '\0';
+
+    /* 只有 200 才算「那边确实是个 dming」；别的程序占着端口时这里就返回 NULL */
+    if (strncmp(buf, "HTTP/1.", 7) != 0 || buf[9] != '2' || buf[10] != '0' ||
+        buf[11] != '0') {
+        free(buf);
+        return NULL;
+    }
+
+    hdr = strstr(buf, "\r\n\r\n");
+    if (!hdr) {
+        free(buf);
+        return NULL;
+    }
+    hdr += 4;
+    if (*hdr == '\0') {
+        free(buf);
+        return NULL;
+    }
+    len -= (size_t)(hdr - buf);
+    memmove(buf, hdr, len);
+    buf[len] = '\0';
+    if (out_len)
+        *out_len = len;
+    return buf;
+}
+
+static int serve_loop(sock_t ls, const pchar *page_path, int beat_ms)
+{
+    time_t last = time(NULL);
+
+    for (;;) {
+        fd_set rd;
+        struct timeval tv;
+        int wait_ms, rc;
+        sock_t c;
+
+        if (beat_ms > 0) {
+            long idle = (long)(time(NULL) - last) * 1000L;
+            wait_ms = beat_ms - (int)idle;
+            if (wait_ms <= 0)
+                return 0;       /* 页面不在了（心跳断了），自己收摊 */
+        } else {
+            wait_ms = 1000;
+        }
+        if (wait_ms > 1000)
+            wait_ms = 1000;
+
+        FD_ZERO(&rd);
+        FD_SET(ls, &rd);
+        tv.tv_sec = wait_ms / 1000;
+        tv.tv_usec = (long)(wait_ms % 1000) * 1000L;
+
+        rc = select((int)(ls + 1), &rd, NULL, NULL, &tv);
+        if (rc < 0) {
+#ifndef _WIN32
+            if (errno == EINTR)
+                continue;
+#endif
+            return -1;
+        }
+        if (rc == 0)
+            continue;
+
+        c = accept(ls, NULL, NULL);
+        if (c == SOCK_BAD)
+            continue;
+        last = time(NULL);
+        sock_timeout(c);
+        handle_conn(c, page_path);
+        sock_close(c);
+    }
+}
+
 typedef struct {
-    int keep;
     int no_open;
     int quiet;
-    int delay_ms;
+    int port;
+    int beat_ms;
     int state_ttl_ms;
 } Options;
 
@@ -1053,15 +1438,21 @@ static void usage(FILE *out, const char *argv0)
         "  p.txt       每行一个学生姓名\n"
         "  class.txt   班级名称，取第一个非空行\n"
         "\n"
+        "页面地址（在浏览器里打开这个）：\n"
+        "  http://127.0.0.1:%d/\n"
+        "\n"
+        "点名进度保存在这个地址的 localStorage 里，所以端口要保持不变。\n"
+        "\n"
         "选项：\n"
-        "  -keep            保留生成的临时 HTML 文件，不自动删除\n"
-        "  -no-open         只生成 HTML，不自动打开浏览器\n"
-        "  -delay <时间>    浏览器打开后等多久再删（默认 3s；可写 800ms / 8s / 8）\n"
+        "  -no-open          不自动打开浏览器（仍然起本地服务，并打印地址）\n"
+        "  -port <端口>      本地服务端口（默认 %d；换端口会让上次的记录失联）\n"
+        "  -heartbeat <时间> 页面心跳断了多久就停止服务（默认 5m；0 表示一直服务）\n"
         "  -state-ttl <时间> 上次点名记录的有效期（默认 7m；可写 45m / 90m / 7200s）\n"
-        "  -quiet           安静模式，只输出临时文件路径\n"
-        "  -h, --help       显示本帮助\n"
-        "  -v, --version    显示版本\n",
-        APP_NAME, APP_VERSION, APP_DESC, argv0);
+        "  -quiet            安静模式，只输出页面地址\n"
+        "  -h, --help        显示本帮助\n"
+        "  -v, --version     显示版本\n",
+        APP_NAME, APP_VERSION, APP_DESC, argv0,
+        DEFAULT_PORT, DEFAULT_PORT);
 }
 
 static int parse_delay(const char *s, int *out_ms)
@@ -1156,6 +1547,8 @@ int main(int argc, char **argv)
     Names names;
     FirstLine fl;
     Buf page, students, cls;
+    sock_t ls;
+    char url[80];
     int i;
 
 #ifdef _WIN32
@@ -1163,20 +1556,41 @@ int main(int argc, char **argv)
     SetConsoleOutputCP(CP_UTF8);
 #endif
 
-    opt.keep = 0;
     opt.no_open = 0;
     opt.quiet = 0;
-    opt.delay_ms = DEFAULT_DELAY_MS;
+    opt.port = DEFAULT_PORT;
+    opt.beat_ms = DEFAULT_BEAT_MS;
     opt.state_ttl_ms = DEFAULT_STATE_TTL_MS;
 
     for (i = 1; i < argc; i++) {
         const char *a = argv[i];
-        if (strcmp(a, "-keep") == 0 || strcmp(a, "--keep") == 0) {
-            opt.keep = 1;
-        } else if (strcmp(a, "-no-open") == 0 || strcmp(a, "--no-open") == 0) {
+        if (strcmp(a, "-no-open") == 0 || strcmp(a, "--no-open") == 0) {
             opt.no_open = 1;
         } else if (strcmp(a, "-quiet") == 0 || strcmp(a, "--quiet") == 0) {
             opt.quiet = 1;
+        } else if (strcmp(a, "-port") == 0 || strcmp(a, "--port") == 0) {
+            char *end = NULL;
+            long v;
+            if (i + 1 >= argc) {
+                fputs("错误：-port 后面要跟端口号，例如 47123\n", stderr);
+                return 2;
+            }
+            v = strtol(argv[++i], &end, 10);
+            if (end == argv[i] || *end != '\0' || v < 1 || v > 65535) {
+                fprintf(stderr, "错误：端口 '%s' 不合法（1-65535）\n", argv[i]);
+                return 2;
+            }
+            opt.port = (int)v;
+        } else if (strcmp(a, "-heartbeat") == 0 || strcmp(a, "--heartbeat") == 0 ||
+                   strcmp(a, "-idle") == 0 || strcmp(a, "--idle") == 0) {
+            if (i + 1 >= argc) {
+                fputs("错误：-heartbeat 后面要跟一个时间，例如 5m 或 0\n", stderr);
+                return 2;
+            }
+            if (parse_delay(argv[++i], &opt.beat_ms) != 0) {
+                fputs("错误：-heartbeat 的时间格式不对（例如 30s / 5m / 0）\n", stderr);
+                return 2;
+            }
         } else if (strcmp(a, "-state-ttl") == 0 || strcmp(a, "--state-ttl") == 0) {
             if (i + 1 >= argc) {
                 fputs("错误：-state-ttl 后面要跟一个时间，例如 45m 或 2h\n", stderr);
@@ -1186,15 +1600,12 @@ int main(int argc, char **argv)
                 fputs("错误：-state-ttl 的时间格式不对（例如 45m / 90m / 2h）\n", stderr);
                 return 2;
             }
-        } else if (strcmp(a, "-delay") == 0 || strcmp(a, "--delay") == 0) {
-            if (i + 1 >= argc) {
-                fputs("错误：-delay 后面要跟一个时间，例如 8s 或 800ms\n", stderr);
-                return 2;
-            }
-            if (parse_delay(argv[++i], &opt.delay_ms) != 0) {
-                fprintf(stderr, "错误：看不懂的时间 '%s'，用 8s / 800ms / 8\n",
-                        argv[i]);
-                return 2;
+        } else if (strcmp(a, "-delay") == 0 || strcmp(a, "--delay") == 0 ||
+                   strcmp(a, "-keep") == 0 || strcmp(a, "--keep") == 0) {
+            fputs("提示：页面不再自动删除，-delay / -keep 已废弃（忽略）\n", stderr);
+            if ((strcmp(a, "-delay") == 0 || strcmp(a, "--delay") == 0) &&
+                i + 1 < argc) {
+                i++;
             }
         } else if (strcmp(a, "-h") == 0 || strcmp(a, "--help") == 0) {
             usage(stdout, argv0);
@@ -1290,7 +1701,7 @@ int main(int argc, char **argv)
     }
 
     if (!opt.quiet)
-        printf("正在生成临时页面...\n");
+        printf("正在生成页面...\n");
 
     page_path = write_page(dir, page.p, page.len);
     if (!page_path) {
@@ -1301,36 +1712,92 @@ int main(int argc, char **argv)
         }
     }
     if (!page_path) {
-        report_error("无法写入临时 HTML 文件（程序目录和系统临时目录都写不进去）");
+        report_error("无法写入页面文件（程序目录和系统临时目录都写不进去）");
+        return 1;
+    }
+
+    snprintf(url, sizeof url, "http://127.0.0.1:%d/", opt.port);
+
+    if (net_global_init() != 0) {
+        report_error("无法初始化网络");
+        return 1;
+    }
+
+    ls = listen_loopback(opt.port);
+    if (ls == SOCK_BAD) {
+        /* 端口被占：可能是上一次的 dming 还在服务，那就复用它的 origin，
+         * 但只有「服务的是同一个页面文件」时复用才是对的。 */
+        char *mine = NULL, *theirs = NULL;
+        size_t tlen = 0;
+        int same = 0;
+
+        if (probe_local(opt.port)) {
+            theirs = http_get_local(opt.port, "/__whoami", &tlen);
+            mine = p_to_utf8(page_path);
+            same = (mine && theirs && strcmp(mine, theirs) == 0);
+        }
+        if (same) {
+            if (!opt.quiet) {
+                printf("%s 已经在运行（端口 %d），直接复用它的记录。\n",
+                       APP_NAME, opt.port);
+                printf("地址: %s\n", url);
+            } else {
+                printf("%s\n", url);
+            }
+            if (!opt.no_open) {
+                pchar *purl = p_from_ascii(url);
+                open_browser(purl);
+                free(purl);
+            }
+            free(mine);
+            free(theirs);
+            net_global_fini();
+            return 0;
+        }
+        if (theirs) {
+            report_error("端口 %d 上运行的 dming 服务的是另一个页面：%s\n"
+                         "先把那个窗口关掉，或换端口：-port 47124（换端口会让上次的记录失联）",
+                         opt.port, theirs);
+        } else {
+            report_error("端口 %d 已被占用（不是 dming）。换一个：-port 47124"
+                         "（换端口会让上次的点名记录失联）", opt.port);
+        }
+        free(mine);
+        free(theirs);
+        net_global_fini();
         return 1;
     }
 
     if (!opt.quiet) {
-        fputs("临时文件: ", stdout);
+        fputs("页面文件: ", stdout);
         fprint_path(stdout, page_path);
         fputc('\n', stdout);
+        printf("地址: %s\n", url);
+        fputs("点名进度存在这个地址下。页面每 30 秒发一次心跳，\n"
+              "关掉页面后 5 分钟（-heartbeat 可调）服务自动停止；Ctrl+C 立即停止。\n\n",
+              stdout);
+    } else {
+        printf("%s\n", url);
+    }
+    fflush(stdout);
+
+    if (!opt.no_open) {
+        pchar *purl = p_from_ascii(url);
+        if (open_browser(purl) != 0 && !opt.quiet)
+            fputs("未能自动打开浏览器，请手动访问上面的地址\n", stdout);
+        free(purl);
     }
 
-    if (opt.no_open) {
-        fprint_path(stdout, page_path);
-        fputc('\n', stdout);
-        return 0;
+    {
+        int rc = serve_loop(ls, page_path, opt.beat_ms);
+        sock_close(ls);
+        net_global_fini();
+        if (!opt.quiet) {
+            if (rc == 0)
+                fputs("页面心跳断了，服务已停止\n", stdout);
+            else
+                fputs("服务异常结束\n", stdout);
+        }
     }
-
-    if (open_browser(page_path) != 0) {
-        if (!opt.quiet)
-            fputs("未能自动打开浏览器，请手动打开上面的文件\n", stdout);
-    } else if (!opt.quiet) {
-        fputs("已调用系统默认浏览器打开\n", stdout);
-    }
-
-    if (opt.keep)
-        return 0;
-
-    sleep_ms(opt.delay_ms);
-    p_remove(page_path);
-    if (!opt.quiet)
-        fputs("临时文件已删除\n", stdout);
-
     return 0;
 }
